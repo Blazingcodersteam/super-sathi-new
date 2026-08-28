@@ -1,0 +1,269 @@
+Profile Complete Condition Implementation Guide
+Date: 21-07-2026
+
+Goal
+All logged-in user-side APIs that list, recommend, search, or display another user's profile must return only fully completed profiles. Admin-side profile listings must not be changed.
+
+Existing validation check
+Before adding new logic, the project was checked for existing profile-completion validation using terms such as profile complete, profile_completion, complete profile, completion, and related function names.
+
+Finding:
+- No reusable function existed that enforced the exact checklist requested for user-side profile visibility.
+- Existing profile-completion code in SettingsController/DashboardController only reports or calculates completion percentage/sections.
+- UserController.completeProfile marks verification fields as complete, but it does not validate the requested checklist and is not suitable for filtering listing APIs.
+
+Reusable implementation
+File:
+- src/utils/profileCompletion.ts
+- compiled runtime file: src/utils/profileCompletion.js
+
+Function:
+- profileCompleteCondition(userAlias = "u", profileAlias = "up")
+
+Purpose:
+- Returns a reusable SQL condition string.
+- The condition can be injected into any SQL query that has a users alias and user_profiles alias.
+- It uses EXISTS subqueries for related tables, so each listing query does not need to join every completion table manually.
+
+Why this file is required:
+- Keeps the completion checklist in one place.
+- Prevents duplicated profile-completion logic across SearchController, MatchController, DashboardController, MatchActionsController, and InboxController.
+- Makes future checklist changes simpler and safer.
+
+Checklist implemented by profileCompleteCondition
+Basic Info:
+- first_name exists
+- last_name exists
+- users.email exists and matches a basic valid email pattern
+- gender_id exists
+- date_of_birth exists
+- birth_time is not required
+- email verification is not required
+
+Other Info:
+- marital_status_id exists
+- height exists
+- weight exists
+- disability_id exists, including the valid "No disability" selection
+- mother_tongue_id exists
+
+Location:
+- location_details.country_id exists
+- location_details.state_id exists
+- location_details.city_id exists
+
+Religion:
+- religion_id exists
+- community_id exists
+- caste_id exists
+- astro_details.manglik_status exists
+
+Qualification:
+- At least one of education_details.education_level_id or career_details.highest_qualification exists.
+- level_name is treated as derived master data from education_level_id, so the stored profile requirement is education_level_id.
+
+Work Details:
+- At least one of career_details.working_with_id, career_details.working_as, or career_details.occupation exists.
+- working_type, profession, and occupation labels are derived from IDs/text already stored in career_details and master joins.
+
+About Me:
+- diet_id exists
+- smoking_id exists
+- drinking_id exists
+- about_myself exists
+
+Hobbies:
+- At least one user_hobbies row exists for the user.
+
+Partner Preferences:
+- At least one partner_preferences row exists where at least one of these is filled:
+  min_age, max_age, min_height, marital_status_ids, religion_ids, education_level_ids, min_income, state_ids.
+- JSON array fields must not be empty strings or [].
+
+Profile Photo:
+- user_profiles.profile_picture exists, or
+- at least one user_photos row exists.
+
+Required code comment
+Every changed code block has the requested comment immediately above the changed condition or import:
+// 21-07-2026 - Profile complete condition
+
+Inside SQL template strings, SQL comments are used:
+-- 21-07-2026 - Profile complete condition
+
+Affected user-side files, APIs, functions, and queries
+
+1. src/Controllers/SearchController.ts
+Route file:
+- src/Routes/searchRoutes.ts
+
+Affected APIs and functions:
+- GET /api/search/profiles -> searchProfiles
+- GET /api/search/profiles-comprehensive -> searchProfilesComprehensive
+- GET /api/search/near-me -> searchNearMe
+- GET /api/search/vivaaha-id/:vivaaha_user_id -> searchByVivahaId
+- GET /api/search/profile/:profileId -> getProfileById
+
+Changes required:
+- Import profileCompleteCondition from ../utils/profileCompletion.
+- Add profileCompleteCondition("u", "up") to dynamic whereConditions in searchProfilesComprehensive.
+- Add profileCompleteCondition("u", "up") to dynamic whereConditions in searchProfiles.
+- Add the condition to both the near-me list query and near-me count query so pagination totals match returned profiles.
+- Add the condition to Vivaaha ID lookup, because it displays another user's profile by ID string.
+- Add the condition to profile-by-ID lookup, because it displays another user's profile.
+
+Why required:
+- Search, filters, profile listing, near-me, direct profile lookup, and Vivaaha ID lookup are user-side discovery surfaces. Without this condition, incomplete profiles could still be returned outside the main search list.
+
+2. src/Controllers/MatchController.ts
+Route file:
+- src/Routes/matchRoutes.ts
+
+Affected APIs and functions:
+- GET /api/matches/my-connections -> getMyConnections
+- GET /api/matches/today -> getTodayMatches
+- GET /api/matches/profile/:matchId -> getMatchProfile
+
+Changes required:
+- Import profileCompleteCondition from ../utils/profileCompletion.
+- Add the condition to my-connections list query.
+- Add the condition to my-connections count query.
+- Add the condition to today's existing matches count query.
+- Add the condition to today's existing matches list query.
+- Add the condition to dynamically generated today's matches whereConditions.
+- Add the condition to match profile detail lookup.
+
+Why required:
+- My Matches and Today's Matches must only surface completed profiles.
+- Counts and pages must match the filtered results.
+- Match profile detail should not expose a profile that would no longer appear in user-side match listings.
+
+3. src/Controllers/DashboardController.ts
+Route file:
+- src/Routes/userRoutes.ts
+
+Affected API and function:
+- GET /api/user/dashboard -> getDashboard
+
+Affected dashboard profile sections:
+- Invitations list
+- Premium matches
+- New matches
+
+Changes required:
+- Import profileCompleteCondition from ../utils/profileCompletion.
+- Add the condition to the invitations query.
+- Add the condition to the premium matches query.
+- Add the condition to the new matches query.
+
+Why required:
+- Dashboard cards are recommendation/listing surfaces where logged-in users view other users' profiles.
+- These sections must follow the same completed-profile visibility rule as search and matches.
+
+4. src/Controllers/MatchActionsController.ts
+Route file:
+- src/Routes/matchActionsRoutes.ts
+
+Affected APIs and functions:
+- GET /api/match-actions/shortlist -> getShortlistedProfiles
+- GET /api/match-actions/blocked -> getBlockedUsers
+- GET /api/match-actions/recently-viewed -> getRecentlyViewedMembers
+- GET /api/match-actions/who-viewed-me -> getWhoViewedMyProfile
+- GET /api/match-actions/ignored -> getIgnoredMembers
+- GET /api/match-actions/connect-requests -> getConnectRequests
+- GET /api/match-actions/my-connections -> getMyConnections
+- GET /api/match-actions/accepted-connections -> getAcceptedConnections
+- GET /api/match-actions/initial-matches -> getInitialMatches
+- Match plan available match count inside getMatchPlanDetails
+
+Changes required:
+- Import profileCompleteCondition from ../utils/profileCompletion.
+- Add the condition to initial ID-selection queries before pagination where applicable.
+- Add the condition to detail-fetch queries that retrieve a single listed profile by id.
+- Add the condition to count queries for paginated lists.
+- Add the condition to connect request and connection list queries using the current aliases u and up.
+- Add the condition to the available_matches count so plan details reflect only visible completed profiles.
+
+Why required:
+- Shortlist, viewed, ignored, connect requests, and connections all render other users' profile cards or profile summaries.
+- Some functions first select IDs and then fetch full profile details. Both stages should be protected so incomplete profiles are neither counted nor returned.
+
+5. src/Controllers/InboxController.ts
+Route file:
+- src/Routes/inboxRoutes.ts
+
+Affected APIs and functions:
+- GET /api/inbox/matches -> getMatchesForInbox
+- Internal helper getProfileDetails, used by inbox tabs that hydrate profile details
+
+Changes required:
+- Import profileCompleteCondition from ../utils/profileCompletion.
+- Add the condition to getProfileDetails so any inbox tab using the helper does not return incomplete profile details.
+- Add the condition to getMatchesForInbox list query.
+- Add the condition to getMatchesForInbox count query.
+
+Why required:
+- Inbox matches are profile recommendations.
+- Inbox tabs such as received/sent/accepted/deleted can hydrate other users' profiles through getProfileDetails, so the helper must enforce the same rule.
+
+Compiled JavaScript files
+The project's package.json uses src/app.js as the start file, and compiled JavaScript is checked in.
+
+After updating TypeScript, run:
+- npx.cmd tsc --noEmit
+- npx.cmd tsc
+
+This updates the matching runtime JavaScript files:
+- src/utils/profileCompletion.js
+- src/Controllers/SearchController.js
+- src/Controllers/MatchController.js
+- src/Controllers/DashboardController.js
+- src/Controllers/MatchActionsController.js
+- src/Controllers/InboxController.js
+
+Admin-side scope
+Admin-side profile listing controllers must not import or use profileCompleteCondition.
+
+Files intentionally not changed:
+- src/Controllers/AdminController.ts
+- src/Controllers/AdminMasterController.ts
+- src/Controllers/AdminVendorConsultationController.ts
+- related compiled Admin*.js files
+
+Reason:
+- The requirement applies only to logged-in user-side APIs where users view other users' profiles.
+- Admin listings should continue to show all profiles for moderation and management.
+
+Implementation pattern for future user-side listing APIs
+When adding any new logged-in user-side API that returns other users' profiles:
+
+1. Import the helper:
+// 21-07-2026 - Profile complete condition
+import { profileCompleteCondition } from "../utils/profileCompletion";
+
+2. Ensure the query has:
+- users alias, usually u
+- user_profiles alias, usually up
+
+3. Add the condition before ORDER BY/LIMIT:
+-- 21-07-2026 - Profile complete condition
+AND ${profileCompleteCondition("u", "up")}
+
+4. If using a dynamic whereConditions array:
+// 21-07-2026 - Profile complete condition
+whereConditions.push(profileCompleteCondition("u", "up"));
+
+5. Apply the same condition to count queries used for pagination.
+
+6. Do not apply it to admin-side queries.
+
+Verification commands
+- npx.cmd tsc --noEmit
+- npx.cmd tsc
+- rg -n "profileCompleteCondition|Profile complete condition" src/Controllers src/utils
+- rg -n "profileCompleteCondition|Profile complete condition" src/Controllers --glob "Admin*.ts" --glob "Admin*.js"
+
+Expected verification result:
+- TypeScript should pass.
+- User-side controller files should show the helper and dated comments.
+- Admin controller search should show no profileCompleteCondition usage.

@@ -1,0 +1,125 @@
+Chat Connection Ended Backend Guide
+
+1. Problem Description
+When two users had an accepted connection and already had a chat conversation, they could continue sending new messages after the connection was cancelled. The connection cancellation changes connect_now_requests.status to cancelled, but the message-send paths did not consistently validate that the connection was still accepted.
+
+2. Previous Behavior
+- Accepted connections could start chats.
+- Existing conversations and old messages remained visible after cancellation.
+- REST message sending still inserted messages after cancellation.
+- Socket.IO message sending allowed existing conversations to send after cancellation because accepted-connection validation was only applied when no conversation existed.
+
+3. Updated Behavior
+- Existing conversations remain visible after cancellation.
+- Old messages remain visible after cancellation.
+- New REST messages are blocked unless connect_now_requests.status is accepted.
+- New Socket.IO messages are blocked unless connect_now_requests.status is accepted.
+- The chat conversation response now includes connection_status and can_message.
+
+4. Files Changed
+- src/Controllers/ChatController.ts
+- src/Controllers/ChatController.js
+- src/socket/SocketManager.ts
+- src/socket/SocketManager.js
+
+5. Exact Function Names
+- getChatList in src/Controllers/ChatController.ts
+- sendMessage in src/Controllers/ChatController.ts
+- getConnectionStatus in src/socket/SocketManager.ts
+- ensureMessageAllowed in src/socket/SocketManager.ts
+- Socket.IO send_message handler in src/socket/SocketManager.ts
+
+6. Exact Updated Line Numbers
+TypeScript source:
+- src/Controllers/ChatController.ts:21 adds the shared ended-connection message.
+- src/Controllers/ChatController.ts:138 starts getChatList.
+- src/Controllers/ChatController.ts:166 adds connection_status for existing conversations.
+- src/Controllers/ChatController.ts:167 adds can_message for existing conversations.
+- src/Controllers/ChatController.ts:211 adds connection_status for new accepted connections.
+- src/Controllers/ChatController.ts:212 adds can_message for new accepted connections.
+- src/Controllers/ChatController.ts:420 starts sendMessage.
+- src/Controllers/ChatController.ts:476 checks connect_now_requests.status before sending.
+- src/Controllers/ChatController.ts:483 blocks sending with the ended-connection response.
+- src/socket/SocketManager.ts:23 adds the shared ended-connection message.
+- src/socket/SocketManager.ts:117 starts getConnectionStatus.
+- src/socket/SocketManager.ts:129 starts ensureMessageAllowed.
+- src/socket/SocketManager.ts:138 checks the current connection status.
+- src/socket/SocketManager.ts:140 blocks socket sending with the ended-connection response.
+- src/socket/SocketManager.ts:298 starts the send_message handler.
+- src/socket/SocketManager.ts:339 applies ensureMessageAllowed before message insert.
+
+Compiled JavaScript:
+- src/Controllers/ChatController.js:24 adds the shared ended-connection message.
+- src/Controllers/ChatController.js:136 starts getChatList.
+- src/Controllers/ChatController.js:163 adds connection_status for existing conversations.
+- src/Controllers/ChatController.js:164 adds can_message for existing conversations.
+- src/Controllers/ChatController.js:207 adds connection_status for new accepted connections.
+- src/Controllers/ChatController.js:208 adds can_message for new accepted connections.
+- src/Controllers/ChatController.js:389 starts sendMessage.
+- src/Controllers/ChatController.js:434 checks connect_now_requests.status before sending.
+- src/Controllers/ChatController.js:440 blocks sending with the ended-connection response.
+- src/socket/SocketManager.js:17 adds the shared ended-connection message.
+- src/socket/SocketManager.js:95 starts getConnectionStatus.
+- src/socket/SocketManager.js:103 starts ensureMessageAllowed.
+- src/socket/SocketManager.js:111 checks the current connection status.
+- src/socket/SocketManager.js:113 blocks socket sending with the ended-connection response.
+- src/socket/SocketManager.js:259 starts the send_message handler.
+- src/socket/SocketManager.js:293 applies ensureMessageAllowed before message insert.
+
+7. Database Status Used
+- accepted: message sending is allowed.
+- cancelled: message sending is blocked.
+- Any missing or non-accepted connect_now_requests status is blocked for new messages.
+
+8. REST Message Validation Flow
+- Validate receiver_id and message/file payload.
+- Validate premium messaging restriction as before.
+- Validate bidirectional block status as before.
+- Query connect_now_requests for the sender/receiver pair.
+- Allow sending only when status is accepted.
+- If not accepted, return success: false with message: This connection has ended. You can no longer send messages to this user.
+- Only after that validation does the existing code find/create the conversation and insert the message.
+
+9. Socket Message Validation Flow
+- Validate user, receiver, message text, premium access, and conversation ownership as before.
+- ensureMessageAllowed now always queries connect_now_requests status for the pair.
+- Existing conversations are no longer exempt from the accepted-connection check.
+- If status is not accepted, the socket ack returns success: false with message: This connection has ended. You can no longer send messages to this user.
+- The message is not inserted and is not emitted.
+
+10. Conversation/Message Visibility After Cancellation
+- getChatList still returns existing chat_conversations after cancellation.
+- getMessages was not changed, so old messages remain visible if the user has access to the conversation and neither user is blocked.
+- Only new message creation is blocked after cancellation.
+
+11. API Response Behavior
+Conversation list rows now include additive fields:
+- connection_status: current connect_now_requests.status, such as accepted or cancelled.
+- can_message: 1 when connection_status is accepted, otherwise 0.
+
+Blocked send response:
+{
+  "success": false,
+  "message": "This connection has ended. You can no longer send messages to this user."
+}
+
+12. Simple Test Cases
+Test 1:
+Accepted connection -> Send message
+Expected: Message sent successfully.
+
+Test 2:
+Accepted connection -> End connection -> Open old chat
+Expected: Old chat and messages are still visible.
+
+Test 3:
+Cancelled connection -> Try REST message send
+Expected: Message sending is blocked with success: false and the ended-connection message.
+
+Test 4:
+Cancelled connection -> Try Socket.IO message send
+Expected: Message is not saved or emitted. Ack returns success: false and the ended-connection message.
+
+Test 5:
+Cancelled connection -> Fetch conversation/messages
+Expected: Existing conversation and old messages are still returned.

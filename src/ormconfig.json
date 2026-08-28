@@ -1,0 +1,14 @@
+[
+  {
+    "name": "default",
+    "type": "mysql",
+    "host": "lawedev.ce8qkgdrivvh.ap-south-1.rds.amazonaws.com",
+    "port": 3306,
+    "username": "admin",
+    "password": "QXNd4AEVJgWE6hX",
+    "database": "Lawe",
+    "schema": "",
+    "synchronize": true,
+    "entities": ["entities/*.js"]
+  }
+]

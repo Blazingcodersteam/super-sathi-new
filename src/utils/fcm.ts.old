@@ -1,0 +1,92 @@
+import * as admin from 'firebase-admin';
+import * as path from 'path';
+
+let initialized = false;
+
+function getApp(): admin.app.App {
+  if (!initialized) {
+    // 1. Try env var first (production)
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (serviceAccountJson) {
+      admin.initializeApp({
+        credential: admin.credential.cert(JSON.parse(serviceAccountJson)),
+      });
+    } else {
+      // 2. Fallback: load the service account JSON file directly
+      const serviceAccountPath = path.resolve(
+        __dirname,
+        'super-sathi-universe-firebase-adminsdk-fbsvc-0f8cb206bd.json'
+      );
+      const serviceAccount = require(serviceAccountPath);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+      });
+    }
+    initialized = true;
+  }
+  return admin.app();
+}
+
+export interface PushPayload {
+  token: string;
+  title: string;
+  body: string;
+  data?: Record<string, string>;
+}
+
+export async function sendPushNotification(payload: PushPayload): Promise<void> {
+  try {
+    const app = getApp();
+    const isCall = payload.data?.type === 'incoming_call';
+    const message: admin.messaging.Message = {
+      token: payload.token,
+      data: {
+        ...payload.data ?? {},
+        title: payload.title,
+        body: payload.body,
+      },
+      android: {
+        priority: 'high',
+        notification: isCall ? {
+          sound: 'default',
+          channelId: 'call_channel',
+          priority: 'max',
+          icon: 'ic_notification',
+        } : {
+          sound: 'default',
+          channelId: 'vivaaha_channel',
+          priority: 'high',
+          icon: 'ic_notification',
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+            contentAvailable: true,
+            mutableContent: true,
+          },
+        },
+        headers: {
+          'apns-priority': '10',
+          'apns-push-type': 'alert',
+        },
+      },
+      notification: {
+        title: payload.title,
+        body: payload.body,
+      },
+    };
+    await app.messaging().send(message);
+  } catch (err: any) {
+    console.error('[FCM] sendPushNotification error:', err);
+    const invalidCodes = [
+      'messaging/registration-token-not-registered',
+      'messaging/invalid-registration-token',
+    ];
+    if (invalidCodes.includes(err?.errorInfo?.code)) {
+      throw Object.assign(err, { invalidToken: true });
+    }
+  }
+}

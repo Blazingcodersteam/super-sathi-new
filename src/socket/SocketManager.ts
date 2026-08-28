@@ -1,0 +1,501 @@
+import { Server as HttpServer } from 'http';
+import { Server as SocketServer, Socket } from 'socket.io';
+import * as jwt from 'jsonwebtoken';
+import * as utils from 'util';
+import { sendPushNotification } from '../utils/fcm';
+
+const db = require('../database');
+const query = utils.promisify(db.query).bind(db);
+const JWT_SECRET = process.env.JWT_SECRET_KEY!;
+
+let io: SocketServer;
+
+type Conversation = {
+  id: number;
+  user1_id: number;
+  user2_id: number;
+};
+
+type SocketAck = (response: { success: boolean; message?: string; message_id?: number; conversation_id?: number }) => void;
+
+const onlineUsers = new Map<number, Set<string>>();
+const CHAT_PUSH_LOG_PREFIX = '[ChatPush]';
+const CONNECTION_ENDED_MESSAGE = 'This connection has ended. You can no longer send messages to this user.';
+
+function getUserId(socket: Socket): number | null {
+  const rawUserId = (socket as any).user?.user_id ?? (socket as any).user?.id;
+  const userId = Number(rawUserId);
+  return Number.isInteger(userId) && userId > 0 ? userId : null;
+}
+
+function normalizeId(value: any): number | null {
+  const id = Number(value);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+function getAllowedOrigins(): string | string[] {
+  const origins = process.env.SOCKET_FRONTEND_URL;
+  if (!origins) return '*';
+  return origins.split(',').map((origin) => origin.trim()).filter(Boolean);
+}
+
+function trackSocket(userId: number, socketId: string) {
+  const sockets = onlineUsers.get(userId) ?? new Set<string>();
+  sockets.add(socketId);
+  onlineUsers.set(userId, sockets);
+}
+
+function untrackSocket(userId: number, socketId: string) {
+  const sockets = onlineUsers.get(userId);
+  if (!sockets) return;
+  sockets.delete(socketId);
+  if (sockets.size === 0) onlineUsers.delete(userId);
+}
+
+function getActiveSocketIds(userId: number): string[] {
+  const sockets = onlineUsers.get(userId);
+  if (!sockets || !io) return [];
+
+  const activeSocketIds: string[] = [];
+  for (const socketId of sockets) {
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket && !socket.disconnected) {
+      activeSocketIds.push(socketId);
+    } else {
+      sockets.delete(socketId);
+    }
+  }
+
+  if (sockets.size === 0) {
+    onlineUsers.delete(userId);
+  }
+
+  return activeSocketIds;
+}
+
+async function getConversationForUser(conversationId: number, userId: number): Promise<Conversation | null> {
+  const [conversation] = await query(
+    `SELECT id, user1_id, user2_id
+     FROM chat_conversations
+     WHERE id = ? AND (user1_id = ? OR user2_id = ?)
+     LIMIT 1`,
+    [conversationId, userId, userId]
+  );
+  return conversation || null;
+}
+
+function getOtherParticipant(conversation: Conversation, userId: number): number {
+  return conversation.user1_id === userId ? conversation.user2_id : conversation.user1_id;
+}
+
+async function getExistingConversation(userId: number, receiverId: number): Promise<Conversation | null> {
+  const [conversation] = await query(
+    `SELECT id, user1_id, user2_id
+     FROM chat_conversations
+     WHERE (user1_id = ? AND user2_id = ?) OR (user1_id = ? AND user2_id = ?)
+     LIMIT 1`,
+    [userId, receiverId, receiverId, userId]
+  );
+  return conversation || null;
+}
+
+async function hasBlockedRelationship(userId: number, receiverId: number): Promise<boolean> {
+  const [blocked] = await query(
+    `SELECT id
+     FROM user_actions
+     WHERE action_type_id IN (2, 3)
+       AND (
+         (user_id = ? AND target_user_id = ?)
+         OR (user_id = ? AND target_user_id = ? AND action_type_id = 3)
+       )
+     LIMIT 1`,
+    [userId, receiverId, receiverId, userId]
+  );
+  return !!blocked;
+}
+
+async function getConnectionStatus(userId: number, receiverId: number): Promise<string | null> {
+  const [connection] = await query(
+    `SELECT status
+     FROM connect_now_requests
+     WHERE ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?))
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+    [userId, receiverId, receiverId, userId]
+  );
+  return connection?.status || null;
+}
+
+async function ensureMessageAllowed(userId: number, receiverId: number) {
+  const [receiver] = await query('SELECT id FROM users WHERE id = ? AND status = 1 LIMIT 1', [receiverId]);
+  if (!receiver) {
+    return { allowed: false, message: 'Receiver not found or inactive' };
+  }
+
+  if (await hasBlockedRelationship(userId, receiverId)) {
+    return { allowed: false, message: 'You cannot message this user' };
+  }
+  const connectionStatus = await getConnectionStatus(userId, receiverId);
+  if (connectionStatus !== 'accepted') {
+    return { allowed: false, message: CONNECTION_ENDED_MESSAGE };
+  }
+
+  return { allowed: true };
+}
+
+async function isPremiumMessagingAllowed(userId: number) {
+  const [general] = await query('SELECT subscription_restrictions FROM general_settings LIMIT 1');
+  if (general && Number(general.subscription_restrictions) === 0) return true;
+
+  const [sub] = await query(
+    `SELECT id
+     FROM user_subscriptions
+     WHERE user_id = ? AND subscription_status_id = 1 AND end_date > NOW()
+     LIMIT 1`,
+    [userId]
+  );
+  return !!sub;
+}
+
+async function sendOfflineChatPushNotification(receiverId: number, payload: any) {
+  const socketStatus = getUserSocketStatus(receiverId);
+  console.log(`${CHAT_PUSH_LOG_PREFIX} Message sent; receiver socket status`, {
+    message_id: payload.id,
+    conversation_id: payload.conversation_id,
+    receiver_id: receiverId,
+    is_online: socketStatus.isOnline,
+    socket_count: socketStatus.socketCount,
+    socket_ids: socketStatus.socketIds,
+  });
+
+  console.log(`${CHAT_PUSH_LOG_PREFIX} FCM will be attempted for chat message`, {
+    message_id: payload.id,
+    receiver_id: receiverId,
+    is_online: socketStatus.isOnline,
+  });
+
+  try {
+    const [receiverUser] = await query('SELECT fcm_token FROM users WHERE id = ?', [receiverId]);
+    const fcmToken = typeof receiverUser?.fcm_token === 'string' ? receiverUser.fcm_token.trim() : '';
+    if (!fcmToken) {
+      console.log(`${CHAT_PUSH_LOG_PREFIX} FCM not triggered because receiver has no token`, {
+        message_id: payload.id,
+        receiver_id: receiverId,
+      });
+      return;
+    }
+
+    console.log(`${CHAT_PUSH_LOG_PREFIX} FCM triggered`, {
+      message_id: payload.id,
+      conversation_id: payload.conversation_id,
+      receiver_id: receiverId,
+      token_suffix: fcmToken.slice(-8),
+      payload_type: 'chat_message',
+    });
+
+   
+    const firebaseMessageId = await sendPushNotification({
+      token: fcmToken,
+      title: payload.sender_name || 'New message',
+      body: payload.message_text || 'You received a new message',
+      data: {
+        type: 'chat_message',
+        message_id: String(payload.id),
+        conversation_id: String(payload.conversation_id),
+        sender_id: String(payload.sender_id),
+        receiver_id: String(payload.receiver_id),
+        chat_message_type: String(payload.message_type || 'text'),
+        message_text: String(payload.message_text || ''),
+        sender_name: String(payload.sender_name || ''),
+        sender_photo: String(payload.sender_photo || ''),
+      },
+    });
+    console.log(`${CHAT_PUSH_LOG_PREFIX} Firebase response`, {
+      message_id: payload.id,
+      receiver_id: receiverId,
+      firebase_message_id: firebaseMessageId,
+    });
+  } catch (fcmError: any) {
+    if (fcmError?.invalidToken) {
+      //await query('UPDATE users SET fcm_token = NULL WHERE id = ?', [receiverId]);
+      console.warn(`${CHAT_PUSH_LOG_PREFIX} Cleared invalid FCM token`, {
+        message_id: payload.id,
+        receiver_id: receiverId,
+        firebase_code: fcmError?.firebaseCode || fcmError?.errorInfo?.code || fcmError?.code,
+      });
+    } else {
+      console.error(`${CHAT_PUSH_LOG_PREFIX} FCM push error`, {
+        message_id: payload.id,
+        receiver_id: receiverId,
+        firebase_code: fcmError?.firebaseCode || fcmError?.errorInfo?.code || fcmError?.code,
+        message: fcmError?.message,
+      });
+    }
+  }
+}
+
+export function initSocket(server: HttpServer): SocketServer {
+  io = new SocketServer(server, {
+    cors: {
+      origin: getAllowedOrigins(),
+      methods: ['GET', 'POST'],
+      credentials: process.env.SOCKET_FRONTEND_URL ? true : false
+    },
+    pingTimeout: 60000,
+    pingInterval: 25000,
+    transports: ['websocket', 'polling'],
+  });
+
+  io.use((socket: Socket, next) => {
+    const authHeader = socket.handshake.headers?.authorization?.toString();
+    const token = socket.handshake.auth?.token || (authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined);
+    if (!token) return next(new Error('No token'));
+
+    jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+      if (err) return next(new Error('Invalid token'));
+      (socket as any).user = user;
+      next();
+    });
+  });
+
+  io.on('connection', (socket: Socket) => {
+    const userId = getUserId(socket);
+    if (!userId) {
+      socket.disconnect();
+      return;
+    }
+
+    trackSocket(userId, socket.id);
+    socket.join(`user_${userId}`);
+    _updateLastActive(userId);
+    console.log(`[Socket] connected userId=${userId} socketId=${socket.id}`);
+
+    socket.on('join_user_room', () => {
+      socket.join(`user_${userId}`);
+    });
+
+    socket.on('join_conversation', async ({ conversation_id }: { conversation_id: number }, ack?: Function) => {
+      const conversationId = normalizeId(conversation_id);
+      if (!conversationId) return ack?.({ success: false, message: 'conversation_id required' });
+
+      try {
+        const conversation = await getConversationForUser(conversationId, userId);
+        if (!conversation) return ack?.({ success: false, message: 'Conversation not found' });
+
+        socket.join(`conv_${conversationId}`);
+        ack?.({ success: true, conversation_id: conversationId });
+      } catch (err) {
+        console.error('[Socket] join_conversation error:', err);
+        ack?.({ success: false, message: 'Server error' });
+      }
+    });
+
+    socket.on('leave_conversation', ({ conversation_id }: { conversation_id: number }) => {
+      const conversationId = normalizeId(conversation_id);
+      if (conversationId) socket.leave(`conv_${conversationId}`);
+    });
+
+    socket.on('send_message', async (
+      data: { receiver_id: number; conversation_id: number | null; message_text: string },
+      ack?: SocketAck
+    ) => {
+      try {
+        const receiverId = normalizeId(data?.receiver_id);
+        const requestedConversationId = normalizeId(data?.conversation_id);
+        const messageText = String(data?.message_text ?? '').trim();
+
+        if (!receiverId || !messageText) {
+          return ack?.({ success: false, message: 'receiver_id and message_text required' });
+        }
+
+        if (receiverId === userId) {
+          return ack?.({ success: false, message: 'Cannot send message to yourself' });
+        }
+
+        if (!(await isPremiumMessagingAllowed(userId))) {
+          return ack?.({
+            success: false,
+            message: 'In the interest of our Premium Members, only Premium users can read and send messages.'
+          });
+        }
+
+        let conversation: Conversation | null = null;
+        let hasExistingConversation = false;
+
+        if (requestedConversationId) {
+          conversation = await getConversationForUser(requestedConversationId, userId);
+          if (!conversation) return ack?.({ success: false, message: 'Conversation not found' });
+
+          const actualReceiverId = getOtherParticipant(conversation, userId);
+          if (actualReceiverId !== receiverId) {
+            return ack?.({ success: false, message: 'receiver_id does not match conversation' });
+          }
+          hasExistingConversation = true;
+        } else {
+          conversation = await getExistingConversation(userId, receiverId);
+          hasExistingConversation = !!conversation;
+        }
+
+        const permission = await ensureMessageAllowed(userId, receiverId);
+        if (!permission.allowed) return ack?.({ success: false, message: permission.message });
+
+        if (!conversation) {
+          const result = await query(
+            'INSERT INTO chat_conversations (user1_id, user2_id) VALUES (?, ?)',
+            [Math.min(userId, receiverId), Math.max(userId, receiverId)]
+          );
+          conversation = {
+            id: result.insertId,
+            user1_id: Math.min(userId, receiverId),
+            user2_id: Math.max(userId, receiverId)
+          };
+        }
+
+        const conversationId = conversation.id;
+        const msgResult = await query(
+          'INSERT INTO chat_messages (conversation_id, sender_id, receiver_id, message_text, message_type) VALUES (?, ?, ?, ?, ?)',
+          [conversationId, userId, receiverId, messageText, 'text']
+        );
+
+        await query(
+          `UPDATE chat_conversations
+           SET last_message_id = ?, last_message_time = NOW(),
+               user1_unread_count = CASE WHEN user1_id = ? THEN user1_unread_count + 1 ELSE user1_unread_count END,
+               user2_unread_count = CASE WHEN user2_id = ? THEN user2_unread_count + 1 ELSE user2_unread_count END
+           WHERE id = ?`,
+          [msgResult.insertId, receiverId, receiverId, conversationId]
+        );
+
+        const [sender] = await query(
+          'SELECT first_name, last_name, profile_picture FROM user_profiles WHERE user_id = ?',
+          [userId]
+        );
+
+        const payload = {
+          id: msgResult.insertId,
+          conversation_id: conversationId,
+          sender_id: userId,
+          receiver_id: receiverId,
+          message_text: messageText,
+          message_type: 'text',
+          is_read: 0,
+          created_at: new Date().toISOString(),
+          sender_name: [sender?.first_name, sender?.last_name].filter(Boolean).join(' '),
+          sender_photo: sender?.profile_picture ?? null,
+        };
+
+        io.to(`user_${receiverId}`).emit('new_message', payload);
+        await sendOfflineChatPushNotification(receiverId, payload);
+        ack?.({ success: true, message_id: msgResult.insertId, conversation_id: conversationId });
+      } catch (err) {
+        console.error('[Socket] send_message error:', err);
+        ack?.({ success: false, message: 'Server error' });
+      }
+    });
+
+    socket.on('typing_start', async ({ conversation_id }: any) => {
+      try {
+        const conversationId = normalizeId(conversation_id);
+        if (!conversationId) return;
+
+        const conversation = await getConversationForUser(conversationId, userId);
+        if (!conversation) return;
+
+        io.to(`user_${getOtherParticipant(conversation, userId)}`).emit('typing_start', {
+          conversation_id: conversationId,
+          sender_id: userId
+        });
+      } catch (err) {
+        console.error('[Socket] typing_start error:', err);
+      }
+    });
+
+    socket.on('typing_stop', async ({ conversation_id }: any) => {
+      try {
+        const conversationId = normalizeId(conversation_id);
+        if (!conversationId) return;
+
+        const conversation = await getConversationForUser(conversationId, userId);
+        if (!conversation) return;
+
+        io.to(`user_${getOtherParticipant(conversation, userId)}`).emit('typing_stop', {
+          conversation_id: conversationId,
+          sender_id: userId
+        });
+      } catch (err) {
+        console.error('[Socket] typing_stop error:', err);
+      }
+    });
+
+    socket.on('mark_read', async ({ conversation_id }: any, ack?: Function) => {
+      try {
+        const conversationId = normalizeId(conversation_id);
+        if (!conversationId) return ack?.({ success: false, message: 'conversation_id required' });
+
+        const conversation = await getConversationForUser(conversationId, userId);
+        if (!conversation) return ack?.({ success: false, message: 'Conversation not found' });
+
+        const senderId = getOtherParticipant(conversation, userId);
+
+        await query(
+          'UPDATE chat_messages SET is_read = 1, read_at = NOW() WHERE conversation_id = ? AND receiver_id = ? AND is_read = 0',
+          [conversationId, userId]
+        );
+        await query(
+          `UPDATE chat_conversations
+           SET user1_unread_count = CASE WHEN user1_id = ? THEN 0 ELSE user1_unread_count END,
+               user2_unread_count = CASE WHEN user2_id = ? THEN 0 ELSE user2_unread_count END
+           WHERE id = ?`,
+          [userId, userId, conversationId]
+        );
+
+        io.to(`user_${senderId}`).emit('messages_read', { conversation_id: conversationId, read_by: userId });
+        ack?.({ success: true, conversation_id: conversationId });
+      } catch (err) {
+        console.error('[Socket] mark_read error:', err);
+        ack?.({ success: false, message: 'Server error' });
+      }
+    });
+
+    socket.on('rejoin_conversations', async (ack?: Function) => {
+      try {
+        const convs = await query(
+          'SELECT id FROM chat_conversations WHERE user1_id = ? OR user2_id = ?',
+          [userId, userId]
+        );
+        for (const conv of convs) {
+          socket.join(`conv_${conv.id}`);
+        }
+        ack?.({ success: true, count: convs.length });
+      } catch (err) {
+        console.error('[Socket] rejoin_conversations error:', err);
+        ack?.({ success: false, message: 'Server error' });
+      }
+    });
+
+    socket.on('disconnect', () => {
+      untrackSocket(userId, socket.id);
+      _updateLastActive(userId);
+      console.log(`[Socket] disconnected userId=${userId} socketId=${socket.id}`);
+    });
+  });
+
+  return io;
+}
+
+async function _updateLastActive(userId: number) {
+  try {
+    await query('UPDATE users SET last_active_at = NOW() WHERE id = ?', [userId]);
+  } catch (_) {}
+}
+
+export function getIO(): SocketServer { return io; }
+export function getUserSocketStatus(userId: number): { isOnline: boolean; socketCount: number; socketIds: string[] } {
+  const socketIds = getActiveSocketIds(userId);
+  return {
+    isOnline: socketIds.length > 0,
+    socketCount: socketIds.length,
+    socketIds,
+  };
+}
+export function isUserOnline(userId: number): boolean { return getUserSocketStatus(userId).isOnline; }

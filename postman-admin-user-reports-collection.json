@@ -1,0 +1,82 @@
+{
+  "info": {
+    "name": "Admin User Reports APIs",
+    "description": "Postman collection for newly implemented admin-side user report listing APIs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Get User Reports List",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{admin_token}}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "{{base_url}}/api/admin/user-reports?page=1&limit=10&search=&status=&report_type=&fromdate=&todate=",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "admin",
+            "user-reports"
+          ],
+          "query": [
+            {
+              "key": "page",
+              "value": "1",
+              "description": "Page number"
+            },
+            {
+              "key": "limit",
+              "value": "10",
+              "description": "Records per page"
+            },
+            {
+              "key": "search",
+              "value": "",
+              "description": "Search reporter/reported user email, phone, Vivaaha ID, name, or report description"
+            },
+            {
+              "key": "status",
+              "value": "",
+              "description": "Optional report status: pending, reviewed, resolved"
+            },
+            {
+              "key": "report_type",
+              "value": "",
+              "description": "Optional report type: profile, photo"
+            },
+            {
+              "key": "fromdate",
+              "value": "",
+              "description": "Optional start date in YYYY-MM-DD format"
+            },
+            {
+              "key": "todate",
+              "value": "",
+              "description": "Optional end date in YYYY-MM-DD format"
+            }
+          ]
+        },
+        "description": "Returns a paginated admin list of user reports with reporter details, reported user details, reason details, report status, report type, description, and reported date."
+      },
+      "response": []
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "admin_token",
+      "value": ""
+    }
+  ]
+}

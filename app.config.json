@@ -1,0 +1,12 @@
+{
+  "apps": [
+    {
+      "name": "vivaapi-server",
+      "script": "npm run start",
+      "interpreter": "none",
+      "args": "serve",
+      "autorestart": true,
+      "watch": true
+    }
+  ]
+}

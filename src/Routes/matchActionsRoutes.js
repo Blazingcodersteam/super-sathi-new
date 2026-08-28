@@ -1,0 +1,38 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const matchActionsController = require("../Controllers/MatchActionsController");
+const auth_1 = require("../middleware/auth");
+const router = (0, express_1.Router)();
+// Match Actions routes
+router.post("/send-interest", auth_1.authenticateToken, matchActionsController.sendInterest);
+router.put("/accept-interest", auth_1.authenticateToken, matchActionsController.acceptInterest);
+router.put("/decline-interest", auth_1.authenticateToken, matchActionsController.declineInterest);
+router.post("/shortlist", auth_1.authenticateToken, matchActionsController.addToShortlist);
+router.delete("/shortlist/:id", auth_1.authenticateToken, matchActionsController.removeFromShortlist);
+router.post("/block", auth_1.authenticateToken, matchActionsController.blockProfile);
+router.delete("/block/:id", auth_1.authenticateToken, matchActionsController.unblockUser);
+router.post("/dont-show-again", auth_1.authenticateToken, matchActionsController.dontShowAgain);
+router.get("/report-reasons", auth_1.authenticateToken, matchActionsController.getReportReasons);
+router.post("/report", auth_1.authenticateToken, matchActionsController.reportProfile);
+router.get("/interests/sent", auth_1.authenticateToken, matchActionsController.getInterestsSent);
+router.get("/interests/received", auth_1.authenticateToken, matchActionsController.getInterestsReceived);
+router.get("/shortlist", auth_1.authenticateToken, matchActionsController.getShortlistedProfiles);
+router.get("/blocked", auth_1.authenticateToken, matchActionsController.getBlockedUsers);
+router.get("/recently-viewed", auth_1.authenticateToken, matchActionsController.getRecentlyViewedMembers);
+router.get("/who-viewed-me", auth_1.authenticateToken, matchActionsController.getWhoViewedMyProfile);
+router.get("/ignored", auth_1.authenticateToken, matchActionsController.getIgnoredMembers);
+router.delete("/ignored/:targetUserId", auth_1.authenticateToken, matchActionsController.removeFromIgnored);
+router.post("/connect-now", auth_1.authenticateToken, matchActionsController.connectNow);
+router.put("/connect-now/accept", auth_1.authenticateToken, matchActionsController.acceptConnectRequest);
+router.put("/connect-now/decline", auth_1.authenticateToken, matchActionsController.declineConnectRequest);
+router.delete("/connect-now/cancel", auth_1.authenticateToken, matchActionsController.cancelConnectRequest);
+router.get("/connect-requests", auth_1.authenticateToken, matchActionsController.getConnectRequests);
+router.get("/connection-status/:target_user_id", auth_1.authenticateToken, matchActionsController.getConnectionStatus);
+router.get("/my-connections", auth_1.authenticateToken, matchActionsController.getMyConnections);
+router.get("/accepted-connections", auth_1.authenticateToken, matchActionsController.getAcceptedConnections);
+router.get("/initial-matches", auth_1.authenticateToken, matchActionsController.getInitialMatches);
+router.post("/connect-selected", auth_1.authenticateToken, matchActionsController.connectWithSelected);
+router.put("/display-preference", auth_1.authenticateToken, matchActionsController.updateDisplayPreference);
+exports.default = router;
+//# sourceMappingURL=matchActionsRoutes.js.map

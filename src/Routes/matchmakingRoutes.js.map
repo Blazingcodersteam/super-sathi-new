@@ -1,0 +1,1 @@
+{"version":3,"file":"matchmakingRoutes.js","sourceRoot":"","sources":["matchmakingRoutes.ts"],"names":[],"mappings":";;AAAA,mCAAmC;AACnC,6CAAuD;AACvD,gFAAoG;AAEpG,MAAM,MAAM,GAAG,OAAO,CAAC,MAAM,EAAE,CAAC;AAEhC,kBAAkB;AAClB,MAAM,CAAC,IAAI,CAAC,cAAc,EAAE,wBAAiB,EAAE,yCAAiB,CAAC,CAAC;AAElE,iDAAiD;AACjD,MAAM,CAAC,IAAI,CAAC,0BAA0B,EAAE,iDAAyB,CAAC,CAAC;AAEnE,kBAAe,MAAM,CAAC"}
