@@ -1,4 +1,5 @@
 import * as utils from "util";
+import { areSubscriptionRestrictionsEnabled } from "../utils/subscriptionAccess";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
@@ -130,6 +131,23 @@ export async function getPostPurchaseAddons(req, res) {
 export async function getFeatureUsage(req, res) {
   try {
     const userId = req.user.user_id;
+
+    // Kill-switch off: report everything as unlimited so the UI never renders a quota bar
+    // or an "upgrade to unlock" prompt. Stored counters are left untouched — they are still
+    // there, unchanged, when restrictions are switched back on.
+    if (!(await areSubscriptionRestrictionsEnabled())) {
+      return res.json({
+        success: true,
+        has_subscription: true,
+        restrictions_disabled: true,
+        plan: null,
+        unlimited: true,
+        features: {
+          contacts: "unlimited",
+          boosts: "unlimited"
+        }
+      });
+    }
 
     // Get active subscription (must not be expired)
     const [subscription] = await query(`

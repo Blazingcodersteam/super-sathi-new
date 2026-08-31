@@ -4,6 +4,29 @@ import * as path from 'path';
 let initialized = false;
 let firebaseProjectId = '';
 
+function connectPerfNow(): number {
+  return performance.now();
+}
+
+function connectPerfElapsed(start: number): number {
+  return Math.round(connectPerfNow() - start);
+}
+
+function connectPerfMeta(perf): string {
+  if (!perf) return "";
+  const parts = [`request=${perf.requestId}`];
+  if (perf.userId !== undefined) parts.push(`user=${perf.userId}`);
+  if (perf.targetUserId !== undefined) parts.push(`target=${perf.targetUserId}`);
+  if (perf.connectionId !== undefined) parts.push(`connection=${perf.connectionId}`);
+  return parts.join(" ");
+}
+
+function logConnectPerf(perf, label: string, start: number, extra = "") {
+  if (!perf) return;
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
+}
+
 function getApp(): admin.app.App {
   if (!initialized) {
     // 1. Try env var first (production)
@@ -39,9 +62,11 @@ export interface PushPayload {
   data?: Record<string, string>;
 }
 
-export async function sendPushNotification(payload: PushPayload): Promise<string | null> {
+export async function sendPushNotification(payload: PushPayload, perf: any = null): Promise<string | null> {
   try {
+    const appStart = perf ? connectPerfNow() : 0;
     const app = getApp();
+    logConnectPerf(perf, "firebase-get-app", appStart);
     const isCall = payload.data?.type === 'incoming_call';
     const tokenSuffix = payload.token ? payload.token.slice(-8) : 'missing';
     const message: admin.messaging.Message = {
@@ -93,7 +118,9 @@ export async function sendPushNotification(payload: PushPayload): Promise<string
       android_channel: message.android?.notification?.channelId,
       data_keys: Object.keys(message.data || {}),
     });
+    const firebaseSendStart = perf ? connectPerfNow() : 0;
     const messageId = await app.messaging().send(message);
+    logConnectPerf(perf, "firebase-send", firebaseSendStart);
     console.log(`[FCM] Firebase send success message_id=${messageId} token_suffix=${tokenSuffix} type=${payload.data?.type || 'unknown'}`);
     return messageId;
   } catch (err: any) {

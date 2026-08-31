@@ -10,6 +10,7 @@ const utils = require("util");
 const privacyFilter_1 = require("../utils/privacyFilter");
 // 21-07-2026 - Profile complete condition
 const profileCompletion_1 = require("../utils/profileCompletion");
+const subscriptionAccess_1 = require("../utils/subscriptionAccess");
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 // Comprehensive Profile Search with Array-based ID filters
@@ -472,16 +473,23 @@ async function searchProfilesComprehensive(req, res) {
         whereConditions.push(`u.id NOT IN (
       SELECT user_id FROM account_settings WHERE profile_hidden = 1
     )`);
-        // Section 11 — exclude visible_to_premium profiles from non-premium viewers
-        whereConditions.push(`u.id NOT IN (
-      SELECT ps2.user_id FROM privacy_settings ps2
-      WHERE ps2.profile_visibility = 'visible_to_premium'
-      AND ? NOT IN (
-        SELECT user_id FROM user_subscriptions
-        WHERE subscription_status_id = 1 AND end_date > NOW()
-      )
-    )`);
-        queryParams.push(userId);
+        // Section 11 — exclude visible_to_premium profiles from non-premium viewers.
+        // Skipped entirely when the admin subscription-restrictions switch is off: the owner
+        // picked the audience CLASS "premium members", and with restrictions off every member
+        // counts as premium, so the profile is visible to everyone. The queryParams.push has to
+        // stay inside the guard — dropping the condition without its bind would shift every
+        // later placeholder by one and silently corrupt the whole WHERE clause.
+        if (await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)()) {
+            whereConditions.push(`u.id NOT IN (
+        SELECT ps2.user_id FROM privacy_settings ps2
+        WHERE ps2.profile_visibility = 'visible_to_premium'
+        AND ? NOT IN (
+          SELECT user_id FROM user_subscriptions
+          WHERE subscription_status_id = 1 AND end_date > NOW()
+        )
+      )`);
+            queryParams.push(userId);
+        }
         // Exclude blocked users — bidirectional
         whereConditions.push(`u.id NOT IN (
       SELECT target_user_id FROM user_actions WHERE user_id = ? AND action_type_id = 3
@@ -721,16 +729,23 @@ async function searchProfilesOLD(req, res) {
         whereConditions.push(`u.id NOT IN (
       SELECT user_id FROM account_settings WHERE profile_hidden = 1
     )`);
-        // Section 11 — exclude visible_to_premium profiles from non-premium viewers
-        whereConditions.push(`u.id NOT IN (
-      SELECT ps2.user_id FROM privacy_settings ps2
-      WHERE ps2.profile_visibility = 'visible_to_premium'
-      AND ? NOT IN (
-        SELECT user_id FROM user_subscriptions
-        WHERE subscription_status_id = 1 AND end_date > NOW()
-      )
-    )`);
-        queryParams.push(userId);
+        // Section 11 — exclude visible_to_premium profiles from non-premium viewers.
+        // Skipped entirely when the admin subscription-restrictions switch is off: the owner
+        // picked the audience CLASS "premium members", and with restrictions off every member
+        // counts as premium, so the profile is visible to everyone. The queryParams.push has to
+        // stay inside the guard — dropping the condition without its bind would shift every
+        // later placeholder by one and silently corrupt the whole WHERE clause.
+        if (await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)()) {
+            whereConditions.push(`u.id NOT IN (
+        SELECT ps2.user_id FROM privacy_settings ps2
+        WHERE ps2.profile_visibility = 'visible_to_premium'
+        AND ? NOT IN (
+          SELECT user_id FROM user_subscriptions
+          WHERE subscription_status_id = 1 AND end_date > NOW()
+        )
+      )`);
+            queryParams.push(userId);
+        }
         // Exclude blocked users — bidirectional
         whereConditions.push(`u.id NOT IN (
       SELECT target_user_id FROM user_actions WHERE user_id = ? AND action_type_id = 3
@@ -1336,16 +1351,23 @@ async function searchProfiles(req, res) {
         whereConditions.push(`u.id NOT IN (
       SELECT user_id FROM account_settings WHERE profile_hidden = 1
     )`);
-        // Section 11 — exclude visible_to_premium profiles from non-premium viewers
-        whereConditions.push(`u.id NOT IN (
-      SELECT ps2.user_id FROM privacy_settings ps2
-      WHERE ps2.profile_visibility = 'visible_to_premium'
-      AND ? NOT IN (
-        SELECT user_id FROM user_subscriptions
-        WHERE subscription_status_id = 1 AND end_date > NOW()
-      )
-    )`);
-        queryParams.push(userId);
+        // Section 11 — exclude visible_to_premium profiles from non-premium viewers.
+        // Skipped entirely when the admin subscription-restrictions switch is off: the owner
+        // picked the audience CLASS "premium members", and with restrictions off every member
+        // counts as premium, so the profile is visible to everyone. The queryParams.push has to
+        // stay inside the guard — dropping the condition without its bind would shift every
+        // later placeholder by one and silently corrupt the whole WHERE clause.
+        if (await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)()) {
+            whereConditions.push(`u.id NOT IN (
+        SELECT ps2.user_id FROM privacy_settings ps2
+        WHERE ps2.profile_visibility = 'visible_to_premium'
+        AND ? NOT IN (
+          SELECT user_id FROM user_subscriptions
+          WHERE subscription_status_id = 1 AND end_date > NOW()
+        )
+      )`);
+            queryParams.push(userId);
+        }
         // Exclude blocked users — bidirectional
         whereConditions.push(`u.id NOT IN (
       SELECT target_user_id FROM user_actions WHERE user_id = ? AND action_type_id = 3

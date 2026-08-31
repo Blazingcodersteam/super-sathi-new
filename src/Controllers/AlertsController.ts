@@ -5,6 +5,29 @@ import { EmailService } from './EmailService';
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 
+function connectPerfNow(): number {
+  return performance.now();
+}
+
+function connectPerfElapsed(start: number): number {
+  return Math.round(connectPerfNow() - start);
+}
+
+function connectPerfMeta(perf): string {
+  if (!perf) return "";
+  const parts = [`request=${perf.requestId}`];
+  if (perf.userId !== undefined) parts.push(`user=${perf.userId}`);
+  if (perf.targetUserId !== undefined) parts.push(`target=${perf.targetUserId}`);
+  if (perf.connectionId !== undefined) parts.push(`connection=${perf.connectionId}`);
+  return parts.join(" ");
+}
+
+function logConnectPerf(perf, label: string, start: number, extra = "") {
+  if (!perf) return;
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
+}
+
 // ── Alert Type IDs (matches alert_types_master) ──────────────────────────────
 const ALERT = {
   PROFILE_LIKE:       1,
@@ -46,21 +69,30 @@ async function sendAlertEmail(
   templateKey: string,
   variables: Record<string, any>,
   fallbackSubject: string,
-  fallbackBody: string
+  fallbackBody: string,
+  perf: any = null
 ) {
   try {
+    const userQueryStart = perf ? connectPerfNow() : 0;
     const [userRow] = await query(
       `SELECT u.email, up.first_name FROM users u
        JOIN user_profiles up ON u.id = up.user_id WHERE u.id = ?`,
       [userId]
     );
-    if (!userRow?.email) return;
+    logConnectPerf(perf, "email-user-db-query", userQueryStart);
+    if (!userRow?.email) {
+      logConnectPerf(perf, "email", connectPerfNow(), "(no-email-address)");
+      return;
+    }
     const vars = { user_name: userRow.first_name ?? 'User', ...variables };
+    const emailStart = perf ? connectPerfNow() : 0;
     await EmailService.sendTemplateEmail(templateKey, userRow.email, vars, {
       fallbackSubject,
       fallbackHtml: defaultEmailHtml(fallbackSubject, fallbackBody),
       fallbackText: fallbackBody,
+      perf,
     });
+    logConnectPerf(perf, "email", emailStart);
   } catch (err) {
     console.error(`[Alert] Email error [${templateKey}]:`, err);
   }
@@ -95,21 +127,27 @@ async function createAlert(
   title: string,
   message: string,
   messageParams: object = {},
-  dataPayload: object | null = null
+  dataPayload: object | null = null,
+  perf: any = null
 ) {
   try {
     
+    const insertStart = perf ? connectPerfNow() : 0;
     await query(
       `INSERT INTO user_alerts (user_id, alert_type_id, from_user_id, title, message, data_payload)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [userId, alertTypeId, fromUserId, title, message,
        dataPayload ? JSON.stringify(dataPayload) : null]
     );
+    logConnectPerf(perf, "notification-insert-db-query", insertStart);
 
     // Send FCM push notification (app background / killed)
     try {
+      const tokenQueryStart = perf ? connectPerfNow() : 0;
       const [userRow] = await query('SELECT fcm_token FROM users WHERE id = ?', [userId]);
+      logConnectPerf(perf, "push-token-db-query", tokenQueryStart);
       if (userRow?.fcm_token) {
+        const pushStart = perf ? connectPerfNow() : 0;
         await sendPushNotification({
           token: userRow.fcm_token,
           title,
@@ -122,11 +160,16 @@ async function createAlert(
               Object.entries(dataPayload as object).map(([k, v]) => [k, String(v)])
             ) : {}),
           },
-        });
+        }, perf);
+        logConnectPerf(perf, "push-notification", pushStart);
+      } else {
+        logConnectPerf(perf, "push-notification", connectPerfNow(), "(no-fcm-token)");
       }
     } catch (fcmErr: any) {
       if (fcmErr?.invalidToken) {
+        const invalidTokenStart = perf ? connectPerfNow() : 0;
         await query('UPDATE users SET fcm_token = NULL WHERE id = ?', [userId]);
+        logConnectPerf(perf, "push-invalid-token-db-update", invalidTokenStart);
       } else {
         console.error('[Alert] FCM push error:', fcmErr?.message ?? fcmErr);
       }
@@ -136,7 +179,8 @@ async function createAlert(
   }
 }
 
-async function getSenderInfo(senderId: number): Promise<{name: string, displayName: string}> {
+async function getSenderInfo(senderId: number, perf: any = null): Promise<{name: string, displayName: string}> {
+  const senderInfoStart = perf ? connectPerfNow() : 0;
   const [p] = await query(
     `SELECT up.first_name, up.show_vivaaha_id, u.vivaaha_user_id,
             CASE WHEN up.show_vivaaha_id = 1 THEN u.vivaaha_user_id 
@@ -147,6 +191,7 @@ async function getSenderInfo(senderId: number): Promise<{name: string, displayNa
      WHERE up.user_id = ?`, 
     [senderId]
   );
+  logConnectPerf(perf, "sender-info-db-query", senderInfoStart);
   return {
     name: p?.first_name ?? "Someone",
     displayName: p?.display_name ?? "Someone"
@@ -412,8 +457,10 @@ export async function createShortlistAlert(shortlistedUserId: number, shortliste
 }
 
 // Connect request received (alert_type_id = 13)
-export async function createConnectNowAlert(receiverUserId: number, senderUserId: number) {
-  const senderInfo = await getSenderInfo(senderUserId);
+export async function createConnectNowAlert(receiverUserId: number, senderUserId: number, perf: any = null) {
+  const alertStart = perf ? connectPerfNow() : 0;
+  const senderInfo = await getSenderInfo(senderUserId, perf);
+  const createAlertStart = perf ? connectPerfNow() : 0;
   await createAlert(
     receiverUserId,
     ALERT.CONNECT_REQUEST,
@@ -421,14 +468,18 @@ export async function createConnectNowAlert(receiverUserId: number, senderUserId
     `${senderInfo.displayName} wants to connect`,
     `${senderInfo.displayName} has sent you a connect request.`,
     {},
-    { action: 'connect_request', sender_id: senderUserId }
+    { action: 'connect_request', sender_id: senderUserId },
+    perf
   );
+  logConnectPerf(perf, "create-alert", createAlertStart);
   await sendAlertEmail(
     receiverUserId, 'connect_request',
     { sender_name: senderInfo.displayName },
     `${senderInfo.displayName} wants to connect with you`,
-    `{{user_name}}, <strong>${senderInfo.displayName}</strong> has sent you a connect request. Accept to start chatting!`
+    `{{user_name}}, <strong>${senderInfo.displayName}</strong> has sent you a connect request. Accept to start chatting!`,
+    perf
   );
+  logConnectPerf(perf, "create-connect-now-alert", alertStart);
 }
 
 // Connect accepted (alert_type_id = 14) — notify original sender

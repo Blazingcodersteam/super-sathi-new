@@ -5,6 +5,30 @@ const admin = require("firebase-admin");
 const path = require("path");
 let initialized = false;
 let firebaseProjectId = '';
+function connectPerfNow() {
+    return performance.now();
+}
+function connectPerfElapsed(start) {
+    return Math.round(connectPerfNow() - start);
+}
+function connectPerfMeta(perf) {
+    if (!perf)
+        return "";
+    const parts = [`request=${perf.requestId}`];
+    if (perf.userId !== undefined)
+        parts.push(`user=${perf.userId}`);
+    if (perf.targetUserId !== undefined)
+        parts.push(`target=${perf.targetUserId}`);
+    if (perf.connectionId !== undefined)
+        parts.push(`connection=${perf.connectionId}`);
+    return parts.join(" ");
+}
+function logConnectPerf(perf, label, start, extra = "") {
+    if (!perf)
+        return;
+    const suffix = extra ? ` ${extra}` : "";
+    console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
+}
 function getApp() {
     if (!initialized) {
         // 1. Try env var first (production)
@@ -30,10 +54,12 @@ function getApp() {
     }
     return admin.app();
 }
-async function sendPushNotification(payload) {
+async function sendPushNotification(payload, perf = null) {
     var _a, _b, _c, _d, _e, _f, _g, _h, _j;
     try {
+        const appStart = perf ? connectPerfNow() : 0;
         const app = getApp();
+        logConnectPerf(perf, "firebase-get-app", appStart);
         const isCall = ((_a = payload.data) === null || _a === void 0 ? void 0 : _a.type) === 'incoming_call';
         const tokenSuffix = payload.token ? payload.token.slice(-8) : 'missing';
         const message = {
@@ -81,7 +107,9 @@ async function sendPushNotification(payload) {
             android_channel: (_f = (_e = message.android) === null || _e === void 0 ? void 0 : _e.notification) === null || _f === void 0 ? void 0 : _f.channelId,
             data_keys: Object.keys(message.data || {}),
         });
+        const firebaseSendStart = perf ? connectPerfNow() : 0;
         const messageId = await app.messaging().send(message);
+        logConnectPerf(perf, "firebase-send", firebaseSendStart);
         console.log(`[FCM] Firebase send success message_id=${messageId} token_suffix=${tokenSuffix} type=${((_g = payload.data) === null || _g === void 0 ? void 0 : _g.type) || 'unknown'}`);
         return messageId;
     }

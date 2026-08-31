@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticateToken, requireSubscriptionFeature } from '../middleware/auth';
+import { isCallTypeGloballyEnabled } from '../utils/subscriptionAccess';
 import {
   createCall,
   acceptCall,
@@ -17,8 +18,25 @@ const router = Router();
 // All routes require authentication
 router.use(authenticateToken);
 
-const requireCallFeature = (req, res, next) => {
+const requireCallFeature = async (req, res, next) => {
   const callType = String(req.body?.call_type || 'voice').toLowerCase();
+
+  // Global admin switch first (general_settings.audio_restrictions / video_restrictions).
+  // When an admin turns a call type off it is off for everyone, whatever their plan — so
+  // this is checked before the per-plan feature. The receiver's own preference
+  // (privacy_settings.voice_call_enabled / video_call_enabled) is checked later, in
+  // CallController.createCall; all three have to pass.
+  if (!(await isCallTypeGloballyEnabled(callType))) {
+    return res.status(403).json({
+      success: false,
+      call_type_disabled: true,
+      error_code: 'CALL_TYPE_DISABLED',
+      message: callType === 'video'
+        ? 'Video calling is currently unavailable.'
+        : 'Voice calling is currently unavailable.',
+    });
+  }
+
   const featureName = callType === 'video' ? 'video_chat_enabled' : 'audio_chat_enabled';
   const message = callType === 'video'
     ? 'Your active subscription plan does not allow video chat.'

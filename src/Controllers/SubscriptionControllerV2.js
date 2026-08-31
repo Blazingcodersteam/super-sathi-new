@@ -23,6 +23,7 @@ exports.confirmMarriage = confirmMarriage;
 exports.changePlan = changePlan;
 exports.activateFreeSubscription = activateFreeSubscription;
 const utils = require("util");
+const subscriptionAccess_1 = require("../utils/subscriptionAccess");
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 // ============================================
@@ -144,6 +145,22 @@ async function getFeatureUsage(req, res) {
     var _a, _b, _c, _d;
     try {
         const userId = req.user.user_id;
+        // Kill-switch off: report everything as unlimited so the UI never renders a quota bar
+        // or an "upgrade to unlock" prompt. Stored counters are left untouched — they are still
+        // there, unchanged, when restrictions are switched back on.
+        if (!(await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)())) {
+            return res.json({
+                success: true,
+                has_subscription: true,
+                restrictions_disabled: true,
+                plan: null,
+                unlimited: true,
+                features: {
+                    contacts: "unlimited",
+                    boosts: "unlimited"
+                }
+            });
+        }
         // Get active subscription (must not be expired)
         const [subscription] = await query(`
       SELECT us.*, sp.plan_name, us.plan_symbol

@@ -4,20 +4,45 @@ import * as nodemailer from "nodemailer";
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 
+function connectPerfNow(): number {
+  return performance.now();
+}
+
+function connectPerfElapsed(start: number): number {
+  return Math.round(connectPerfNow() - start);
+}
+
+function connectPerfMeta(perf): string {
+  if (!perf) return "";
+  const parts = [`request=${perf.requestId}`];
+  if (perf.userId !== undefined) parts.push(`user=${perf.userId}`);
+  if (perf.targetUserId !== undefined) parts.push(`target=${perf.targetUserId}`);
+  if (perf.connectionId !== undefined) parts.push(`connection=${perf.connectionId}`);
+  return parts.join(" ");
+}
+
+function logConnectPerf(perf, label: string, start: number, extra = "") {
+  if (!perf) return;
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
+}
+
 export class EmailService {
   private static transporter: nodemailer.Transporter;
   private static transporterConfig: string = '';
 
   // Initialize email transporter
-  static async initializeTransporter() {
+  static async initializeTransporter(perf: any = null) {
     try {
       // Try DB general_settings first
       let config: any = null;
 
       try {
+        const smtpSettingsStart = perf ? connectPerfNow() : 0;
         const settings = await query(
           "SELECT smtp_host, smtp_port, smtp_username, smtp_password, smtp_encryption, smtp_from_email, smtp_from_name FROM general_settings WHERE id = 1"
         );
+        logConnectPerf(perf, "email-smtp-settings-db-query", smtpSettingsStart);
         if (settings.length > 0 && settings[0].smtp_host && settings[0].smtp_username) {
           config = settings[0];
           console.log('📧 SMTP config loaded from general_settings DB');
@@ -62,7 +87,9 @@ export class EmailService {
       });
 
       // Verify connection
+      const verifyStart = perf ? connectPerfNow() : 0;
       await this.transporter.verify();
+      logConnectPerf(perf, "email-transporter-verify", verifyStart);
       this.transporterConfig = configSignature;
       console.log('✅ Email transporter initialized successfully');
     } catch (error) {
@@ -155,17 +182,24 @@ export class EmailService {
       cc?: string | string[];
       bcc?: string | string[];
       attachments?: any[];
+      perf?: any;
       fallbackSubject?: string;
       fallbackHtml?: string;
       fallbackText?: string;
     } = {}
   ) {
     try {
+      const perf = (options as any).perf || null;
+      const emailServiceStart = perf ? connectPerfNow() : 0;
       if (!this.transporter) {
-        await this.initializeTransporter();
+        const transporterStart = perf ? connectPerfNow() : 0;
+        await this.initializeTransporter(perf);
+        logConnectPerf(perf, "email-transporter-init", transporterStart);
       }
 
+      const templateStart = perf ? connectPerfNow() : 0;
       const result = await this.getTemplate(templateKey);
+      logConnectPerf(perf, "email-template-db-query", templateStart);
 
       // Template exists but is INACTIVE → skip silently
       if (result.found && !result.active) {
@@ -176,9 +210,11 @@ export class EmailService {
       let fromEmail: string;
       let fromName: string;
       try {
+        const fromSettingsStart = perf ? connectPerfNow() : 0;
         const settings = await query(
           "SELECT smtp_from_email, smtp_from_name FROM general_settings WHERE id = 1"
         );
+        logConnectPerf(perf, "email-from-settings-db-query", fromSettingsStart);
         const dbConfig = settings[0];
         fromEmail = dbConfig?.smtp_from_email || process.env.EMAIL_FROM || process.env.EMAIL_USER || '';
         fromName  = dbConfig?.smtp_from_name  || process.env.EMAIL_FROM_NAME || 'Vivaaha Matrimony';
@@ -191,6 +227,7 @@ export class EmailService {
       let htmlBody: string;
       let textBody: string;
 
+      const renderStart = perf ? connectPerfNow() : 0;
       if (result.found && result.active) {
         // ── Admin has active template → use it
         subject  = await this.replaceVariables(result.template.subject, variables);
@@ -209,7 +246,9 @@ export class EmailService {
         return { success: false, skipped: true, reason: `No template for key: ${templateKey}` };
       }
 
-      const { fallbackSubject, fallbackHtml, fallbackText, ...mailExtras } = options;
+      logConnectPerf(perf, "email-template-render", renderStart);
+
+      const { fallbackSubject, fallbackHtml, fallbackText, perf: _perf, ...mailExtras } = options as any;
 
       const mailOptions = {
         from: `${fromName} <${fromEmail}>`,
@@ -220,8 +259,11 @@ export class EmailService {
         ...mailExtras
       };
 
+      const sendMailStart = perf ? connectPerfNow() : 0;
       const sent = await this.transporter.sendMail(mailOptions);
+      logConnectPerf(perf, "email-smtp-send", sendMailStart);
       console.log(`✅ Email sent [${templateKey}]:`, sent.messageId);
+      logConnectPerf(perf, "email-service-total", emailServiceStart);
       return { success: true, messageId: sent.messageId, template: templateKey, to: mailOptions.to };
     } catch (error) {
       console.error(`❌ Error sending email [${templateKey}]:`, error);

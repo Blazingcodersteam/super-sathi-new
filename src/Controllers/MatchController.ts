@@ -3,6 +3,7 @@ import { createProfileViewAlert } from "./AlertsController";
 import { applyPrivacyFilterToMatches, applyPrivacyFilter } from "../utils/privacyFilter";
 // 21-07-2026 - Profile complete condition
 import { profileCompleteCondition } from "../utils/profileCompletion";
+import { areSubscriptionRestrictionsEnabled } from "../utils/subscriptionAccess";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
@@ -197,18 +198,26 @@ export async function getTodayMatches(req, res) {
 
       let whereConditions = [`u.id != ?`, `u.status = 1`, `up.exclude_from_matchmaking = FALSE`, `up.aadhaar_verified = 1`,
         `u.id NOT IN (SELECT user_id FROM user_hide_profile WHERE is_active = TRUE AND hide_end_date > NOW())`,
-        `u.id NOT IN (SELECT user_id FROM account_settings WHERE profile_hidden = 1)`,
-        // Section 11 — exclude visible_to_premium profiles from non-premium viewers
-        `u.id NOT IN (
+        `u.id NOT IN (SELECT user_id FROM account_settings WHERE profile_hidden = 1)`
+      ];
+      let queryParams = [userId];
+
+      // Section 11 — exclude visible_to_premium profiles from non-premium viewers.
+      // Skipped when the admin subscription-restrictions switch is off, because the owner
+      // picked the audience CLASS "premium members" and with restrictions off everyone
+      // qualifies. The condition and its bind are added together — queryParams starts as
+      // [userId] and gains the second entry only here, so the placeholders stay aligned.
+      if (await areSubscriptionRestrictionsEnabled()) {
+        whereConditions.push(`u.id NOT IN (
           SELECT ps2.user_id FROM privacy_settings ps2
           WHERE ps2.profile_visibility = 'visible_to_premium'
           AND ? NOT IN (
             SELECT user_id FROM user_subscriptions
             WHERE subscription_status_id = 1 AND end_date > NOW()
           )
-        )`
-      ];
-      let queryParams = [userId, userId];
+        )`);
+        queryParams.push(userId);
+      }
 
       // 21-07-2026 - Profile complete condition
       whereConditions.push(profileCompleteCondition("u", "up"));

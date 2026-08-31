@@ -1,3 +1,5 @@
+import { isViewerPremium } from "./subscriptionAccess";
+
 const db = require("../database");
 const utils = require("util");
 const query = utils.promisify(db.query).bind(db);
@@ -61,15 +63,16 @@ async function getPrivacySettings(userId: number): Promise<PrivacySettings> {
   };
 }
 
-// ── Check if viewer has active subscription ──────────────────────────────────
+// ── Check if viewer should see premium-gated fields ──────────────────────────
+// Routed through the shared helper so the admin "subscription restrictions" switch reaches
+// this file. With the switch off every viewer counts as premium, which lifts the
+// premium-only masking of photo/phone/email/DOB/income below.
+//
+// This only affects gates that exist because the VIEWER has not paid. The profile owner's
+// own choices ('no_one', 'hide_email', 'hide_dob', 'keep_private', block lists, …) are
+// evaluated separately further down and stay in force either way.
 async function viewerIsPremium(viewerId: number): Promise<boolean> {
-  const [sub] = await query(
-    `SELECT id FROM user_subscriptions
-     WHERE user_id = ? AND subscription_status_id = 1 AND end_date > NOW()
-     LIMIT 1`,
-    [viewerId]
-  );
-  return !!sub;
+  return isViewerPremium(viewerId);
 }
 
 // ── Check if viewer has sent interest to profile owner ───────────────────────

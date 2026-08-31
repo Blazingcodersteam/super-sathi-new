@@ -12,9 +12,33 @@ import {
 import { applyPrivacyFilterToMatches, applyPrivacyFilter } from "../utils/privacyFilter";
 // 21-07-2026 - Profile complete condition
 import { profileCompleteCondition } from "../utils/profileCompletion";
+import { isViewerPremium } from "../utils/subscriptionAccess";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
+
+function connectPerfNow(): number {
+  return performance.now();
+}
+
+function connectPerfElapsed(start: number): number {
+  return Math.round(connectPerfNow() - start);
+}
+
+function connectPerfMeta(perf): string {
+  if (!perf) return "";
+  const parts = [`request=${perf.requestId}`];
+  if (perf.userId !== undefined) parts.push(`user=${perf.userId}`);
+  if (perf.targetUserId !== undefined) parts.push(`target=${perf.targetUserId}`);
+  if (perf.connectionId !== undefined) parts.push(`connection=${perf.connectionId}`);
+  return parts.join(" ");
+}
+
+function logConnectPerf(perf, label: string, start: number, extra = "") {
+  if (!perf) return;
+  const suffix = extra ? ` ${extra}` : "";
+  console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
+}
 
 // Get parent filter clause for a user — returns SQL snippet
 async function getParentFilter(userId: number): Promise<string> {
@@ -1406,25 +1430,56 @@ export async function removeFromIgnored(req, res) {
 
 // Connect Now
 export async function connectNow(req, res) {
+  const perf = req.connectPerf || null;
+  const totalStart = perf?.startedAt ?? connectPerfNow();
   try {
     const userId = req.user.user_id;
     const { target_user_id, message } = req.body;
-
-    if (target_user_id === userId) {
-      return res.status(400).json({ success: false, message: "You cannot send a connect request to yourself" });
+    if (perf) {
+      perf.userId = userId;
+      perf.targetUserId = target_user_id;
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} Connect API started`);
     }
 
-    await query(
+    const validationStart = perf ? connectPerfNow() : 0;
+    if (target_user_id === userId) {
+      logConnectPerf(perf, "request-validation", validationStart, "(self-connect-rejected)");
+      if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} TOTAL API TIME: ${connectPerfElapsed(totalStart)}ms`);
+      return res.status(400).json({ success: false, message: "You cannot send a connect request to yourself" });
+    }
+    logConnectPerf(perf, "request-validation", validationStart);
+
+    if (perf) {
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} subscription-limit-check: 0ms (not present in current connect-now flow)`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} block-check: 0ms (not present in current connect-now flow)`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} duplicate-connection-check: 0ms (handled inside create-connection upsert)`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} receiver-filter-db-queries: 0ms (not present in current connect-now flow)`);
+    }
+
+    const createConnectionStart = perf ? connectPerfNow() : 0;
+    const connectionResult = await query(
       "INSERT INTO connect_now_requests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'pending', updated_at = CURRENT_TIMESTAMP",
       [userId, target_user_id, message]
     );
+    if (perf && connectionResult?.insertId) perf.connectionId = connectionResult.insertId;
+    logConnectPerf(perf, "create-connection-db-operation", createConnectionStart);
 
     // Create alert for receiver
-    await createConnectNowAlert(target_user_id, userId);
+    const notificationStart = perf ? connectPerfNow() : 0;
+    await createConnectNowAlert(target_user_id, userId, perf);
+    logConnectPerf(perf, "create-notification-total", notificationStart);
+
+    if (perf) {
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} sms-whatsapp: 0ms (not present in current connect-now flow)`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} activity-logging: 0ms (not present in current connect-now flow)`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} other-operations: 0ms`);
+      console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} TOTAL API TIME: ${connectPerfElapsed(totalStart)}ms`);
+    }
 
     res.json({ success: true, message: "Connect request sent successfully" });
   } catch (error) {
     console.error("Connect Now Error:", error);
+    if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} TOTAL API TIME: ${connectPerfElapsed(totalStart)}ms (error)`);
     res.status(500).json({ success: false, message: "Server error" });
   }
 }
@@ -1589,13 +1644,10 @@ export async function getInitialMatches(req, res) {
   try {
     const userId = req.user.user_id;
 
-    // Check subscription → limit 10 for subscribed, 3 for free
-    const [subscription] = await query(`
-      SELECT id FROM user_subscriptions
-      WHERE user_id = ? AND is_active = 1 AND end_date >= CURDATE()
-      LIMIT 1
-    `, [userId]);
-    const hasSubscription = !!subscription;
+    // Check subscription → limit 10 for subscribed, 3 for free.
+    // isViewerPremium() also returns true for everyone while the admin subscription
+    // restrictions switch is off, so free members get the full 10 in that mode.
+    const hasSubscription = await isViewerPremium(userId);
     const limit = hasSubscription ? 10 : 3;
 
     // Get current user's gender and preferences

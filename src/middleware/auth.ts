@@ -1,15 +1,51 @@
 import * as jwt from "jsonwebtoken";
+import { areSubscriptionRestrictionsEnabled } from "../utils/subscriptionAccess";
 
 const JWT_SECRET = process.env.JWT_SECRET_KEY;
 const db = require("../database");
 const utils = require("util");
 const query = utils.promisify(db.query).bind(db);
 
+function isConnectPerfRequest(req): boolean {
+  return req?.method === "POST" && req?.originalUrl?.includes("/match-actions/connect-now");
+}
+
+function connectPerfNow(): number {
+  return performance.now();
+}
+
+function connectPerfElapsed(start: number): number {
+  return Math.round(connectPerfNow() - start);
+}
+
+function getConnectPerf(req) {
+  if (!isConnectPerfRequest(req)) return null;
+  if (!req.connectPerf) {
+    req.connectPerf = {
+      requestId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      startedAt: connectPerfNow(),
+    };
+    console.log(`[CONNECT-PERF] request=${req.connectPerf.requestId} Request started`);
+  }
+  return req.connectPerf;
+}
+
+function connectPerfMeta(perf): string {
+  if (!perf) return "";
+  const parts = [`request=${perf.requestId}`];
+  if (perf.userId !== undefined) parts.push(`user=${perf.userId}`);
+  if (perf.targetUserId !== undefined) parts.push(`target=${perf.targetUserId}`);
+  return parts.join(" ");
+}
+
 export function authenticateToken(req, res, next) {
+  const perf = getConnectPerf(req);
+  const authStart = perf ? connectPerfNow() : 0;
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
 
   if (!token) {
+    if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} authentication-validation: ${connectPerfElapsed(authStart)}ms (missing-token)`);
     return res.status(401).json({
       success: false,
       message: "Access token required",
@@ -18,19 +54,24 @@ export function authenticateToken(req, res, next) {
 
   jwt.verify(token, JWT_SECRET, async (err, user) => {
     if (err) {
+      if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} authentication-validation: ${connectPerfElapsed(authStart)}ms (invalid-token)`);
       return res.status(403).json({
         success: false,
         message: "Invalid or expired token",
       });
     }
+    if (perf) perf.userId = user?.user_id;
 
     // Check if user still exists and is not deleted (status = 4)
     try {
+      const dbStart = perf ? connectPerfNow() : 0;
       const [dbUser] = await query(
         "SELECT id, status FROM users WHERE id = ? LIMIT 1",
         [user.user_id]
       );
+      if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} auth-user-db-query: ${connectPerfElapsed(dbStart)}ms`);
       if (!dbUser || dbUser.status === 4) {
+        if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} authentication-validation: ${connectPerfElapsed(authStart)}ms (account-deleted)`);
         return res.status(401).json({
           success: false,
           account_deleted: true,
@@ -42,6 +83,7 @@ export function authenticateToken(req, res, next) {
     }
 
     req.user = user;
+    if (perf) console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} authentication-validation: ${connectPerfElapsed(authStart)}ms`);
     next();
   });
 }
@@ -58,14 +100,11 @@ export function requireAdmin(req, res, next) {
 
 const PREMIUM_CHAT_MESSAGE = 'In the interest of our Premium Members, only Premium users can read and send messages.';
 
+// Delegates to the shared helper so this file, the privacy filter, the feature meter and
+// the socket layer all agree on the flag. The old inline version compared with `=== 0`,
+// which silently kept restrictions ON whenever the driver handed back "0" as a string.
 async function getSubscriptionRestrictionsEnabled() {
-  const [general] = await query(
-    `SELECT subscription_restrictions FROM general_settings
-     LIMIT 1`
-  );
-
-  // 0 = Restrictions disabled
-  return !(general && general.subscription_restrictions === 0);
+  return areSubscriptionRestrictionsEnabled();
 }
 
 export async function requireSubscriptionFeature(req, res, next, featureName, message = PREMIUM_CHAT_MESSAGE) {

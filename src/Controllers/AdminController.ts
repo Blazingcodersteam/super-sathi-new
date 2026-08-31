@@ -6,6 +6,7 @@ import * as path from "path";
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import { sendMail } from "./SendMailController";
 import { EmailService } from "./EmailService";
+import { invalidateSubscriptionRestrictionsCache } from "../utils/subscriptionAccess";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
@@ -5010,6 +5011,56 @@ export async function getGeneralSettings(req, res) {
   }
 }
 
+// ── general_settings write helpers ───────────────────────────────────────────
+// Some deployments define the column as
+//   `video_restrictions` tinyint(1) GENERATED ALWAYS AS (0) VIRTUAL
+// and a generated column cannot be assigned. Assigning one makes MySQL/MariaDB reject the
+// entire statement ("The value specified for generated column 'video_restrictions' in
+// table 'general_settings' has been ignored"), so EVERY General/Site settings save failed —
+// including the subscription-restrictions toggle, which is why the switch appeared to do
+// nothing. Resolve the writable columns from information_schema once and never assign a
+// generated one.
+let generalSettingsWritableColumns: Set<string> | null = null;
+
+async function getWritableGeneralSettingsColumns(): Promise<Set<string>> {
+  if (generalSettingsWritableColumns) return generalSettingsWritableColumns;
+
+  const columns = await query(
+    `SELECT COLUMN_NAME, EXTRA, GENERATION_EXPRESSION
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'general_settings'`
+  );
+
+  const writable = new Set<string>();
+  for (const column of columns || []) {
+    const extra = String(column.EXTRA || '').toUpperCase();
+    const generationExpression = String(column.GENERATION_EXPRESSION || '').trim();
+    if (!extra.includes('GENERATED') && generationExpression === '') {
+      writable.add(String(column.COLUMN_NAME));
+    }
+  }
+
+  generalSettingsWritableColumns = writable;
+  return writable;
+}
+
+// The restriction switches reach us as 1/0, "1"/"0", true/false or "on"/"off" depending on
+// which admin screen posted them. Normalise to a tinyint. undefined/null/"" means "not
+// supplied", which the COALESCE below turns into "keep whatever is stored".
+function normalizeRestrictionFlag(value: any): number | null {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'boolean') return value ? 1 : 0;
+
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on', 'enabled'].includes(normalized)) return 1;
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(normalized)) return 0;
+
+  const numeric = Number(normalized);
+  if (Number.isNaN(numeric)) return null;
+  return numeric !== 0 ? 1 : 0;
+}
+
 // Update General Settings
 export async function updateGeneralSettings(req, res) {
   try {
@@ -5040,69 +5091,90 @@ export async function updateGeneralSettings(req, res) {
       video_restrictions
     } = req.body;
 
+    // Every column is written through COALESCE(?, column) so a screen that posts only part
+    // of the form cannot blank the fields it does not manage. That matters most for the
+    // restriction switches: General Settings and Site Settings both PUT here, and the
+    // toggle set on one screen must survive a save from the other.
+    const candidateColumns: Array<{ column: string; value: any }> = [
+      { column: 'site_name', value: site_name },
+      { column: 'site_logo', value: site_logo },
+      { column: 'primary_color', value: primary_color },
+      { column: 'secondary_color', value: secondary_color },
+      { column: 'email_1', value: email_1 },
+      { column: 'email_2', value: email_2 },
+      { column: 'phone_number', value: phone_number },
+      { column: 'address', value: address },
+      { column: 'facebook_url', value: facebook_url },
+      { column: 'instagram_url', value: instagram_url },
+      { column: 'twitter_url', value: twitter_url },
+      { column: 'linkedin_url', value: linkedin_url },
+      { column: 'youtube_url', value: youtube_url },
+      { column: 'threads_url', value: threads_url },
+      { column: 'smtp_host', value: smtp_host },
+      { column: 'smtp_port', value: smtp_port },
+      { column: 'smtp_username', value: smtp_username },
+      { column: 'smtp_password', value: smtp_password },
+      { column: 'smtp_encryption', value: smtp_encryption },
+      { column: 'smtp_from_email', value: smtp_from_email },
+      { column: 'smtp_from_name', value: smtp_from_name },
+      { column: 'subscription_restrictions', value: normalizeRestrictionFlag(subscription_restrictions) },
+      { column: 'audio_restrictions', value: normalizeRestrictionFlag(audio_restrictions) },
+      { column: 'video_restrictions', value: normalizeRestrictionFlag(video_restrictions) }
+    ];
+
+    // An empty set means the lookup found nothing (unexpected schema) — fall back to
+    // writing every column rather than silently saving nothing.
+    const writableColumns = await getWritableGeneralSettingsColumns();
+    const writes = writableColumns.size === 0
+      ? candidateColumns
+      : candidateColumns.filter((candidate) => writableColumns.has(candidate.column));
+
     // Check if settings exist
     const [existing] = await query('SELECT id FROM general_settings LIMIT 1');
 
     if (existing) {
       // Update existing settings
+      const setClause = writes
+        .map((write) => `${write.column} = COALESCE(?, ${write.column})`)
+        .join(',\n         ');
+
       await query(
         `UPDATE general_settings SET
-         site_name = COALESCE(?, site_name),
-         site_logo = COALESCE(?, site_logo),
-         primary_color = COALESCE(?, primary_color),
-         secondary_color = COALESCE(?, secondary_color),
-         email_1 = COALESCE(?, email_1),
-         email_2 = COALESCE(?, email_2),
-         phone_number = COALESCE(?, phone_number),
-         address = COALESCE(?, address),
-         facebook_url = COALESCE(?, facebook_url),
-         instagram_url = COALESCE(?, instagram_url),
-         twitter_url = COALESCE(?, twitter_url),
-         linkedin_url = COALESCE(?, linkedin_url),
-         youtube_url = COALESCE(?, youtube_url),
-         threads_url = COALESCE(?, threads_url),
-         smtp_host = COALESCE(?, smtp_host),
-         smtp_port = COALESCE(?, smtp_port),
-         smtp_username = COALESCE(?, smtp_username),
-         smtp_password = COALESCE(?, smtp_password),
-         smtp_encryption = COALESCE(?, smtp_encryption),
-         smtp_from_email = COALESCE(?, smtp_from_email),
-         smtp_from_name = COALESCE(?, smtp_from_name),
-         subscription_restrictions = ?,
-         audio_restrictions = ?,
-         video_restrictions = ?,
+         ${setClause},
          updated_at = CURRENT_TIMESTAMP
          WHERE id = ?`,
-        [
-          site_name, site_logo, primary_color, secondary_color,
-          email_1, email_2, phone_number, address,
-          facebook_url, instagram_url, twitter_url, linkedin_url,
-          youtube_url, threads_url, smtp_host, smtp_port,
-          smtp_username, smtp_password, smtp_encryption,
-          smtp_from_email, smtp_from_name, subscription_restrictions, audio_restrictions, video_restrictions, existing.id
-        ]
+        [...writes.map((write) => write.value), existing.id]
       );
     } else {
-      // Insert new settings
+      // Insert new settings. Defaults live here so a first-run insert still lands sensible
+      // values for anything the caller omitted.
+      const insertDefaults: Record<string, any> = {
+        site_name: 'Super sathi',
+        primary_color: '#000000',
+        secondary_color: '#000000',
+        smtp_encryption: 'tls',
+        smtp_from_name: 'Super sathi',
+        subscription_restrictions: 0,
+        audio_restrictions: 0,
+        video_restrictions: 0
+      };
+
+      const insertColumns = writes.map((write) => write.column);
+      const insertValues = writes.map((write) => {
+        if (write.value !== null && write.value !== undefined) return write.value;
+        return insertDefaults[write.column] !== undefined ? insertDefaults[write.column] : null;
+      });
+
       await query(
-        `INSERT INTO general_settings
-         (site_name, site_logo, primary_color, secondary_color,
-          email_1, email_2, phone_number, address,
-          facebook_url, instagram_url, twitter_url, linkedin_url,
-          youtube_url, threads_url, smtp_host, smtp_port,
-          smtp_username, smtp_password, smtp_encryption,
-          smtp_from_email, smtp_from_name, subscription_restrictions, audio_restrictions, video_restrictions)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          site_name || 'Super sathi', site_logo, primary_color || '#000000', secondary_color || '#000000',
-          email_1, email_2, phone_number, address,
-          facebook_url, instagram_url, twitter_url, linkedin_url,
-          youtube_url, threads_url, smtp_host, smtp_port,
-          smtp_username, smtp_password, smtp_encryption || 'tls',
-          smtp_from_email, smtp_from_name || 'Super sathi', subscription_restrictions, audio_restrictions, video_restrictions
-        ]
+        `INSERT INTO general_settings (${insertColumns.join(', ')})
+         VALUES (${insertColumns.map(() => '?').join(', ')})`,
+        insertValues
       );
     }
+
+    // Drop the cached restrictions flag so flipping the switch takes effect on the very
+    // next request instead of waiting for the cache TTL to lapse.
+    invalidateSubscriptionRestrictionsCache();
 
     res.json({
       success: true,
@@ -5150,9 +5222,28 @@ export async function uploadSiteLogoFile(req, res) {
         [logoUrl, existing.id]
       );
     } else {
+      // video_restrictions is omitted deliberately — it is a generated column on some
+      // schemas and assigning it makes the server reject the whole INSERT.
+      const seedColumns = [
+        { column: 'site_logo', value: logoUrl },
+        { column: 'site_name', value: 'Super sathi' },
+        { column: 'primary_color', value: '#000000' },
+        { column: 'secondary_color', value: '#000000' },
+        { column: 'smtp_encryption', value: 'tls' },
+        { column: 'smtp_from_name', value: 'Super sathi' },
+        { column: 'subscription_restrictions', value: 0 },
+        { column: 'audio_restrictions', value: 0 }
+      ];
+
+      const writableColumns = await getWritableGeneralSettingsColumns();
+      const seedWrites = writableColumns.size === 0
+        ? seedColumns
+        : seedColumns.filter((seed) => writableColumns.has(seed.column));
+
       await query(
-        'INSERT INTO general_settings (site_logo, site_name, primary_color, secondary_color, smtp_encryption, smtp_from_name, subscription_restrictions, audio_restrictions, video_restrictions) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-        [logoUrl, 'Super sathi', '#000000', '#000000', 'tls', 'Super sathi', 0, 0, 0]
+        `INSERT INTO general_settings (${seedWrites.map((seed) => seed.column).join(', ')})
+         VALUES (${seedWrites.map(() => '?').join(', ')})`,
+        seedWrites.map((seed) => seed.value)
       );
     }
 

@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.applyPrivacyFilter = applyPrivacyFilter;
 exports.applyPrivacyFilterToMatches = applyPrivacyFilterToMatches;
+const subscriptionAccess_1 = require("./subscriptionAccess");
 const db = require("../database");
 const utils = require("util");
 const query = utils.promisify(db.query).bind(db);
@@ -21,12 +22,16 @@ async function getPrivacySettings(userId) {
     // Merge: privacy_settings row may not exist (user never changed settings)
     return Object.assign(Object.assign({}, (ps || {})), { show_vivaaha_id: (_a = base === null || base === void 0 ? void 0 : base.show_vivaaha_id) !== null && _a !== void 0 ? _a : 0, vivaaha_user_id: (_b = base === null || base === void 0 ? void 0 : base.vivaaha_user_id) !== null && _b !== void 0 ? _b : null });
 }
-// ── Check if viewer has active subscription ──────────────────────────────────
+// ── Check if viewer should see premium-gated fields ──────────────────────────
+// Routed through the shared helper so the admin "subscription restrictions" switch reaches
+// this file. With the switch off every viewer counts as premium, which lifts the
+// premium-only masking of photo/phone/email/DOB/income below.
+//
+// This only affects gates that exist because the VIEWER has not paid. The profile owner's
+// own choices ('no_one', 'hide_email', 'hide_dob', 'keep_private', block lists, …) are
+// evaluated separately further down and stay in force either way.
 async function viewerIsPremium(viewerId) {
-    const [sub] = await query(`SELECT id FROM user_subscriptions
-     WHERE user_id = ? AND subscription_status_id = 1 AND end_date > NOW()
-     LIMIT 1`, [viewerId]);
-    return !!sub;
+    return (0, subscriptionAccess_1.isViewerPremium)(viewerId);
 }
 // ── Check if viewer has sent interest to profile owner ───────────────────────
 // IMPORTANT: Photo requests (message containing "photo") only count if ACCEPTED by owner.

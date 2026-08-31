@@ -1,4 +1,5 @@
 import * as utils from "util";
+import { areSubscriptionRestrictionsEnabled } from "../utils/subscriptionAccess";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
@@ -303,13 +304,21 @@ export async function checkSubscriptionStatus(req, res) {
       ORDER BY us.created_at DESC LIMIT 1
     `, [userId]);
 
-    const hasActiveSubscription = subscription && subscription.status === 'active';
-    const isPremiumUser = hasActiveSubscription;
+    const hasActiveSubscription = !!(subscription && subscription.status === 'active');
+
+    // is_premium_user answers "may this member use premium features?", which is not the same
+    // question as "did they pay?". With the admin subscription-restrictions switch off every
+    // member may, so it resolves true for everyone. has_active_subscription stays literal —
+    // it still reports whether a real subscription exists — and the flag is echoed back so a
+    // client can tell the two apart without a second request.
+    const restrictionsEnabled = await areSubscriptionRestrictionsEnabled();
+    const isPremiumUser = restrictionsEnabled ? hasActiveSubscription : true;
 
     res.json({
       success: true,
       has_active_subscription: hasActiveSubscription,
       is_premium_user: isPremiumUser,
+      subscription_restrictions: restrictionsEnabled ? 1 : 0,
       subscription_details: subscription || null
     });
   } catch (error) {

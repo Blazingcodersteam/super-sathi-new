@@ -5,6 +5,7 @@ exports.useFeature = useFeature;
 exports.getPlanComparison = getPlanComparison;
 exports.getMarriageConfirmationStatus = getMarriageConfirmationStatus;
 const utils = require("util");
+const subscriptionAccess_1 = require("../utils/subscriptionAccess");
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 // Maps client-facing feature codes to DB feature_name in subscription_features_master
@@ -34,6 +35,16 @@ async function checkFeatureAccess(req, res) {
     try {
         const userId = req.user.user_id;
         const { feature_code } = req.body;
+        // Kill-switch off: every feature is open to everyone, with no limit to burn down.
+        if (!(await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)())) {
+            return res.json({
+                success: true,
+                allowed: true,
+                unlimited: true,
+                restrictions_disabled: true,
+                message: "Subscription restrictions are disabled"
+            });
+        }
         // Get active subscription
         const [subscription] = await query(`
       SELECT us.*, sp.plan_name
@@ -225,6 +236,12 @@ async function getMarriageConfirmationStatus(req, res) {
 }
 // Helper function
 async function checkAccess(userId, featureCode) {
+    // Kill-switch off: allow unconditionally. Returning unlimited also stops useFeature()
+    // from incrementing user_feature_usage, so nobody's quota is silently burned down while
+    // the switch is off and their counters are intact when it is switched back on.
+    if (!(await (0, subscriptionAccess_1.areSubscriptionRestrictionsEnabled)())) {
+        return { allowed: true, unlimited: true, message: "Subscription restrictions are disabled" };
+    }
     const [subscription] = await query(`
     SELECT us.*, sp.plan_name
     FROM user_subscriptions us
