@@ -127,8 +127,6 @@ export async function sendOTP(req, res) {
     res.json({
       success: true,
       message: "OTP sent successfully",
-      otp:otp,
-      sms:sms
     });
   } catch (error) {
     console.error("Send OTP Error:", error);
@@ -585,7 +583,6 @@ export async function beforeOTP(req, res) {
       profile_for: profile_for || null,
       phone,
       country_code_id: country_code_id || 1,
-      otp:otp
     });
   } catch (error) {
     console.error("Before OTP Error:", error);

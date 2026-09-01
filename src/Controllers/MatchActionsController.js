@@ -65,7 +65,7 @@ function logConnectPerf(perf, label, start, extra = "") {
     const suffix = extra ? ` ${extra}` : "";
     console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
 }
-// Get parent filter clause for a user — returns SQL snippet
+// Get parent filter clause for a user â€” returns SQL snippet
 async function getParentFilter(userId) {
     const [profile] = await query(`SELECT profile_created_by FROM user_profiles WHERE user_id = ?`, [userId]);
     return (profile === null || profile === void 0 ? void 0 : profile.profile_created_by) === 'parent' ? `AND up.profile_created_by = 'parent'` : '';
@@ -115,8 +115,9 @@ async function sendInterest(req, res) {
         }
         // Insert interest
         await query("INSERT INTO user_interests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'sent') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'sent', updated_at = CURRENT_TIMESTAMP", [userId, target_user_id, message]);
+        const [interestRow] = await query("SELECT id FROM user_interests WHERE sender_id = ? AND receiver_id = ? LIMIT 1", [userId, target_user_id]);
         // Create alert for receiver
-        await (0, AlertsController_1.createInterestAlert)(target_user_id, userId);
+        await (0, AlertsController_1.createInterestAlert)(target_user_id, userId, interestRow === null || interestRow === void 0 ? void 0 : interestRow.id);
         res.json({ success: true, message: "Interest sent successfully" });
     }
     catch (error) {
@@ -136,7 +137,7 @@ async function acceptInterest(req, res) {
         // Notify the original sender that their interest was accepted
         const [interest] = await query("SELECT sender_id FROM user_interests WHERE id = ?", [interest_id]);
         if (interest)
-            await (0, AlertsController_1.createInterestAcceptedAlert)(interest.sender_id, userId);
+            await (0, AlertsController_1.createInterestAcceptedAlert)(interest.sender_id, userId, interest_id);
         res.json({ success: true, message: "Interest accepted successfully" });
     }
     catch (error) {
@@ -153,7 +154,7 @@ async function declineInterest(req, res) {
         // Notify the original sender that their interest was declined
         const [interest] = await query("SELECT sender_id FROM user_interests WHERE id = ?", [interest_id]);
         if (interest)
-            await (0, AlertsController_1.createInterestDeclinedAlert)(interest.sender_id, userId);
+            await (0, AlertsController_1.createInterestDeclinedAlert)(interest.sender_id, userId, interest_id);
         res.json({ success: true, message: "Interest declined successfully" });
     }
     catch (error) {
@@ -187,7 +188,7 @@ async function unblockUser(req, res) {
         if (!isBlocked) {
             return res.status(400).json({ success: false, message: "User is not blocked" });
         }
-        // Remove only the blocker's row (A→B)
+        // Remove only the blocker's row (Aâ†’B)
         await query("DELETE FROM user_actions WHERE user_id = ? AND target_user_id = ? AND action_type_id = 3", [userId, targetId]);
         // Sync privacy_settings.block_users JSON array
         const [existing] = await query("SELECT block_users FROM privacy_settings WHERE user_id = ?", [userId]);
@@ -547,7 +548,7 @@ async function getBlockedUsers(req, res) {
       SELECT COUNT(*) as total FROM user_actions
       WHERE user_id = ? AND action_type_id = 3
     `, [userId]);
-        // Do NOT apply privacy filter here — these are blocked users, we want to show their info
+        // Do NOT apply privacy filter here â€” these are blocked users, we want to show their info
         const validProfiles = enrichedProfiles.filter((p) => p !== null && p !== undefined);
         res.json({
             success: true,
@@ -577,12 +578,13 @@ async function addToShortlist(req, res) {
             return res.status(400).json({ success: false, message: "You cannot shortlist yourself" });
         }
         await query("INSERT INTO user_actions (user_id, target_user_id, action_type_id) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE created_at = CURRENT_TIMESTAMP", [userId, target_user_id]);
-        // Section 12 — only notify if shortlist_visibility = 'let_others_know' (default)
-        // 'do_not_let_others_know' → skip alert entirely
+        const [shortlistAction] = await query("SELECT id FROM user_actions WHERE user_id = ? AND target_user_id = ? AND action_type_id = 1 LIMIT 1", [userId, target_user_id]);
+        // Section 12 â€” only notify if shortlist_visibility = 'let_others_know' (default)
+        // 'do_not_let_others_know' â†’ skip alert entirely
         const [ps] = await query(`SELECT shortlist_visibility FROM privacy_settings WHERE user_id = ?`, [target_user_id]);
         const visibility = (_a = ps === null || ps === void 0 ? void 0 : ps.shortlist_visibility) !== null && _a !== void 0 ? _a : 'let_others_know';
         if (visibility !== 'do_not_let_others_know') {
-            await (0, AlertsController_1.createShortlistAlert)(target_user_id, userId);
+            await (0, AlertsController_1.createShortlistAlert)(target_user_id, userId, shortlistAction === null || shortlistAction === void 0 ? void 0 : shortlistAction.id);
         }
         res.json({ success: true, message: "Added to shortlist successfully" });
     }
@@ -604,7 +606,7 @@ async function dontShowAgain(req, res) {
         res.status(500).json({ success: false, message: "Server error" });
     }
 }
-// Block Profile (bidirectional — blocked user also cannot see blocker's profile)
+// Block Profile (bidirectional â€” blocked user also cannot see blocker's profile)
 async function blockProfile(req, res) {
     try {
         const userId = req.user.user_id;
@@ -614,7 +616,7 @@ async function blockProfile(req, res) {
         if (alreadyBlocked) {
             return res.status(400).json({ success: false, message: "User already blocked" });
         }
-        // Insert only one-directional block (A→B)
+        // Insert only one-directional block (Aâ†’B)
         // Visibility is bidirectional via OR condition in privacyFilter
         await query("INSERT INTO user_actions (user_id, target_user_id, action_type_id) VALUES (?, ?, 3) ON DUPLICATE KEY UPDATE created_at = CURRENT_TIMESTAMP", [userId, target_user_id]);
         // Sync privacy_settings.block_users JSON array
@@ -1262,12 +1264,14 @@ async function connectNow(req, res) {
         }
         const createConnectionStart = perf ? connectPerfNow() : 0;
         const connectionResult = await query("INSERT INTO connect_now_requests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'pending', updated_at = CURRENT_TIMESTAMP", [userId, target_user_id, message]);
-        if (perf && (connectionResult === null || connectionResult === void 0 ? void 0 : connectionResult.insertId))
-            perf.connectionId = connectionResult.insertId;
+        const [connectionRow] = await query("SELECT id FROM connect_now_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1", [userId, target_user_id]);
+        const connectionRequestId = (connectionRow === null || connectionRow === void 0 ? void 0 : connectionRow.id) || (connectionResult === null || connectionResult === void 0 ? void 0 : connectionResult.insertId);
+        if (perf && connectionRequestId)
+            perf.connectionId = connectionRequestId;
         logConnectPerf(perf, "create-connection-db-operation", createConnectionStart);
         // Create alert for receiver
         const notificationStart = perf ? connectPerfNow() : 0;
-        await (0, AlertsController_1.createConnectNowAlert)(target_user_id, userId, perf);
+        await (0, AlertsController_1.createConnectNowAlert)(target_user_id, userId, perf, connectionRequestId);
         logConnectPerf(perf, "create-notification-total", notificationStart);
         if (perf) {
             console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} sms-whatsapp: 0ms (not present in current connect-now flow)`);
@@ -1302,7 +1306,7 @@ async function acceptConnectRequest(req, res) {
         // Notify the original sender that their connect request was accepted
         const [req2] = await query("SELECT sender_id FROM connect_now_requests WHERE id = ?", [request_id]);
         if (req2)
-            await (0, AlertsController_1.createConnectAcceptedAlert)(req2.sender_id, userId);
+            await (0, AlertsController_1.createConnectAcceptedAlert)(req2.sender_id, userId, request_id);
         res.json({ success: true, message: "Connect request accepted successfully" });
     }
     catch (error) {
@@ -1328,7 +1332,7 @@ async function declineConnectRequest(req, res) {
         // Notify the original sender that their connect request was declined
         const [req2] = await query("SELECT sender_id FROM connect_now_requests WHERE id = ?", [request_id]);
         if (req2)
-            await (0, AlertsController_1.createConnectDeclinedAlert)(req2.sender_id, userId);
+            await (0, AlertsController_1.createConnectDeclinedAlert)(req2.sender_id, userId, request_id);
         res.json({ success: true, message: "Connect request declined successfully" });
     }
     catch (error) {
@@ -1336,7 +1340,7 @@ async function declineConnectRequest(req, res) {
         res.status(500).json({ success: false, message: "Server error" });
     }
 }
-// Cancel Connect Request (by sender — A withdraws their own pending OR accepted request)
+// Cancel Connect Request (by sender â€” A withdraws their own pending OR accepted request)
 async function cancelConnectRequest(req, res) {
     try {
         const userId = req.user.user_id;
@@ -1415,7 +1419,7 @@ async function getConnectRequests(req, res) {
 async function getInitialMatches(req, res) {
     try {
         const userId = req.user.user_id;
-        // Check subscription → limit 10 for subscribed, 3 for free.
+        // Check subscription â†’ limit 10 for subscribed, 3 for free.
         // isViewerPremium() also returns true for everyone while the admin subscription
         // restrictions switch is off, so free members get the full 10 in that mode.
         const hasSubscription = await (0, subscriptionAccess_1.isViewerPremium)(userId);
@@ -1641,7 +1645,7 @@ async function getInitialMatches(req, res) {
                     }
                 } });
         }));
-        // ── Apply privacy filter to all matches (DOB, income, photo, phone, email)
+        // â”€â”€ Apply privacy filter to all matches (DOB, income, photo, phone, email)
         const filteredMatches = await (0, privacyFilter_1.applyPrivacyFilterToMatches)(enrichedMatches.filter(Boolean), userId);
         res.json({
             success: true,
@@ -1957,8 +1961,9 @@ async function connectWithSelected(req, res) {
                     continue;
                 }
                 await query("INSERT INTO connect_now_requests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'pending', updated_at = CURRENT_TIMESTAMP", [userId, targetUserId, message]);
+                const [connectionRow] = await query("SELECT id FROM connect_now_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1", [userId, targetUserId]);
                 // Create alert for each receiver
-                await (0, AlertsController_1.createConnectNowAlert)(targetUserId, userId);
+                await (0, AlertsController_1.createConnectNowAlert)(targetUserId, userId, null, connectionRow === null || connectionRow === void 0 ? void 0 : connectionRow.id);
                 results.push({ user_id: targetUserId, status: 'sent' });
             }
             catch (error) {

@@ -38,6 +38,7 @@ const vendorRoutes_1 = require("./Routes/vendorRoutes");
 const staffRoutes_1 = require("./Routes/staffRoutes");
 const CallbackController_1 = require("./Controllers/CallbackController");
 const OTPController_1 = require("./Controllers/OTPController");
+const CallController_1 = require("./Controllers/CallController");
 const jwt = require("jsonwebtoken");
 const fs = require("fs");
 const path = require("path");
@@ -74,7 +75,24 @@ app.use(session({
 }));
 app.use(passport_1.default.initialize());
 app.use(passport_1.default.session());
+// Root and Health endpoints
+app.get("/", (req, res) => {
+    res.status(200).json({
+        status: "online",
+        service: "Supersathi Backend API",
+        version: "1.0.0"
+    });
+});
+app.get("/health", (req, res) => {
+    res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
+app.get("/api/health", (req, res) => {
+    res.status(200).json({ status: "ok", timestamp: new Date().toISOString() });
+});
 // API root
+app.get("/api", (req, res) => {
+    res.status(200).send("Supersathi API Code");
+});
 app.get("/api/", (req, res) => {
     res.status(200).send("Supersathi API Code");
 });
@@ -85,7 +103,7 @@ app.post("/api/send_otp_phone", OTPController_1.sendOtp);
 app.post("/api/verify_phone_otp", OTPController_1.verifyOtp);
 // DigiLocker callback
 app.get("/verification/callback", CallbackController_1.handleDigiLockerCallback);
-// Module routes (MUST be before static file serving)
+// Module routes (MUST be before static file serving and fallback handlers)
 app.use("/api/admin", adminRoutes);
 app.use("/api/auth", authRoutes_1.default);
 app.use("/api/user", userRoutes_1.default);
@@ -110,38 +128,51 @@ app.use("/api/calls", callRoutes_1.default);
 app.use("/api/auth", googleAuthRoutes_1.default);
 app.use("/api/user/document-verification", documentVerificationRoutes_1.default);
 app.use("/api/vendor", vendorRoutes_1.default);
-// ==== Serve Static Files ====
-app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
-// ==== Serve Admin Static Files ====
-const adminBuildPath = path.join(__dirname, "admin");
-app.use("/admin", express.static(adminBuildPath));
-// ==== Serve React Front-End (front folder) ====
-const frontBuildPath = path.join(__dirname, "front");
-app.get("/admin/*", (req, res) => {
-    res.sendFile(path.join(adminBuildPath, "index.html"));
-});
-app.use("/", express.static(frontBuildPath));
-app.get(/^(?!\/api|\/admin).*/, (req, res) => {
-    res.sendFile(path.join(frontBuildPath, "index.html"));
-});
-// Only serve index.html for non-API routes
-app.get(/^(?!\/api).*/, (req, res) => {
-    res.sendFile(path.join(adminBuildPath, "index.html"));
-});
+// ==== Serve Uploaded Static Files ====
+const uploadsPath = path.resolve(__dirname, "../uploads");
+if (fs.existsSync(uploadsPath)) {
+    app.use("/uploads", express.static(uploadsPath));
+}
+// ==== Optional Admin / Frontend Static Files (Safe fallback only if build artifacts exist) ====
+const adminBuildPath = path.resolve(__dirname, "admin");
+const frontBuildPath = path.resolve(__dirname, "front");
+const hasAdminIndex = fs.existsSync(path.join(adminBuildPath, "index.html"));
+const hasFrontIndex = fs.existsSync(path.join(frontBuildPath, "index.html"));
+if (hasAdminIndex) {
+    app.use("/admin", express.static(adminBuildPath));
+    app.get("/admin/*", (req, res) => {
+        res.sendFile(path.join(adminBuildPath, "index.html"));
+    });
+}
+if (hasFrontIndex) {
+    app.use(express.static(frontBuildPath));
+    app.get("*", (req, res, next) => {
+        if (req.path.startsWith("/api") || req.path.startsWith("/uploads") || req.path.startsWith("/verification")) {
+            return next();
+        }
+        res.sendFile(path.join(frontBuildPath, "index.html"));
+    });
+}
 // ==== API 404 Handler ====
-app.use('/api/*', (req, res) => {
-    res.status(404).json({ error: 'API endpoint not found' });
+app.use("/api/*", (req, res) => {
+    res.status(404).json({ error: "API endpoint not found" });
+});
+// ==== General 404 Handler (for unmatched routes when frontend build is not served by backend) ====
+app.use((req, res) => {
+    res.status(404).json({ error: "Resource not found" });
 });
 // ==== Express Error Middleware ====
 app.use((err, req, res, next) => {
     logErrorToFile(err);
-    res.status(500).json({ error: "Internal Server Error" });
+    res.status(err.status || 500).json({ error: "Internal Server Error" });
 });
 const server = http.createServer(app);
 (0, SocketManager_1.initSocket)(server);
 server.listen(port, () => {
     console.log(`server listening on ${port}`);
     console.log(`Socket.IO ready on ws://localhost:${port}`);
+    // Start background worker for auto-expiring stale ringing calls
+    (0, CallController_1.startCallExpirationWorker)();
     cron.schedule("0 0 * * *", async () => {
         const mysql2 = require("mysql2/promise");
         let conn;
@@ -176,12 +207,14 @@ server.on("error", (err) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, shutting down gracefully');
+    (0, CallController_1.stopCallExpirationWorker)();
     server.close(() => {
         console.log('Process terminated');
     });
 });
 process.on('SIGINT', () => {
     console.log('SIGINT received, shutting down gracefully');
+    (0, CallController_1.stopCallExpirationWorker)();
     server.close(() => {
         console.log('Process terminated');
     });

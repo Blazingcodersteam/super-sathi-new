@@ -376,8 +376,7 @@ export async function sendNameUpdateOTP(req, res) {
 
       res.json({
         success: true,
-        message: "OTP sent successfully to your email",
-        otp: otp
+        message: "OTP sent successfully to your email"
       });
     } catch (emailError) {
       console.error("Email sending failed:", emailError);
@@ -533,7 +532,6 @@ export async function sendEmailVerificationOTPOld(req, res) {
 
     res.json({
       success: true,
-      otp: otp,
       message: "OTP sent successfully to your email"
     });
   } catch (error) {
@@ -584,7 +582,6 @@ export async function sendEmailVerificationOTP(req, res) {
 
     res.json({
       success: true,
-      otp,
       message: "OTP sent successfully",
       profile_for: req.body.profile_for || null,
       phone,

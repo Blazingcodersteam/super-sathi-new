@@ -165,6 +165,7 @@ exports.initiateAuthenticatedRenewal = initiateAuthenticatedRenewal;
 // ============ VERIFY RENEWAL PAYMENT - FOR RAZORPAY ============
 const verifyAuthenticatedRenewalPayment = async (req, res) => {
     var _a;
+    let connection = null;
     try {
         const vendorId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
@@ -219,39 +220,98 @@ const verifyAuthenticatedRenewalPayment = async (req, res) => {
             });
             return;
         }
-        // Update payment status
-        await query(`UPDATE vendor_payments SET 
-       payment_status = 'completed', 
-       gateway_payment_id = ?, 
-       gateway_response = ?,
-       paid_at = CURRENT_TIMESTAMP 
-       WHERE vendor_id = ? AND gateway_order_id = ?`, [razorpay_payment_id, JSON.stringify(razorpayPayment), vendorId, razorpay_order_id]);
-        // Update subscription end date
-        const currentSub = await query("SELECT * FROM vendor_subscriptions WHERE vendor_id = ? ORDER BY subscription_end_date DESC LIMIT 1", [vendorId]);
-        if (currentSub.length > 0) {
-            const newEndDate = new Date(currentSub[0].subscription_end_date);
-            newEndDate.setMonth(newEndDate.getMonth() + 1);
-            await query("UPDATE vendor_subscriptions SET subscription_end_date = ?, updated_at = CURRENT_TIMESTAMP WHERE vendor_id = ? AND id = ?", [newEndDate, vendorId, currentSub[0].id]);
-        }
-        res.json({
-            success: true,
-            message: "Renewal payment verified successfully",
-            data: {
-                payment_id: razorpay_payment_id,
-                order_id: razorpay_order_id,
-                status: 'success',
-                new_subscription_end_date: currentSub.length > 0 ? new Date(currentSub[0].subscription_end_date).toISOString().split('T')[0] : null
-            }
+        // Acquire dedicated connection for atomic post-capture transaction
+        connection = await new Promise((resolve, reject) => {
+            db.getConnection((err, conn) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve(conn);
+            });
         });
+        const queryConn = (sql, params = []) => {
+            return new Promise((resolve, reject) => {
+                connection.query(sql, params, (err, results) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(results);
+                });
+            });
+        };
+        await new Promise((resolve, reject) => {
+            connection.beginTransaction((err) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve();
+            });
+        });
+        let newEndDateFormatted = null;
+        try {
+            // 1. Update payment status
+            await queryConn(`UPDATE vendor_payments SET 
+         payment_status = 'completed', 
+         gateway_payment_id = ?, 
+         gateway_response = ?,
+         paid_at = CURRENT_TIMESTAMP 
+         WHERE vendor_id = ? AND gateway_order_id = ?`, [razorpay_payment_id, JSON.stringify(razorpayPayment), vendorId, razorpay_order_id]);
+            // 2. Update subscription end date
+            const currentSub = await queryConn("SELECT * FROM vendor_subscriptions WHERE vendor_id = ? ORDER BY subscription_end_date DESC LIMIT 1", [vendorId]);
+            if (currentSub.length > 0) {
+                const newEndDate = new Date(currentSub[0].subscription_end_date);
+                newEndDate.setMonth(newEndDate.getMonth() + 1);
+                newEndDateFormatted = newEndDate.toISOString().split('T')[0];
+                await queryConn("UPDATE vendor_subscriptions SET subscription_end_date = ?, updated_at = CURRENT_TIMESTAMP WHERE vendor_id = ? AND id = ?", [newEndDate, vendorId, currentSub[0].id]);
+            }
+            // 3. Commit transaction
+            await new Promise((resolve, reject) => {
+                connection.commit((err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve();
+                });
+            });
+            res.json({
+                success: true,
+                message: "Renewal payment verified successfully",
+                data: {
+                    payment_id: razorpay_payment_id,
+                    order_id: razorpay_order_id,
+                    status: 'success',
+                    new_subscription_end_date: newEndDateFormatted
+                }
+            });
+        }
+        catch (txnError) {
+            await new Promise((resolve) => {
+                connection.rollback(() => resolve());
+            });
+            console.error(`[CRITICAL PAYMENT RECONCILIATION NEEDED] Vendor renewal payment captured (PaymentID: ${razorpay_payment_id}, OrderID: ${razorpay_order_id}, Vendor: ${vendorId}), but DB transaction failed and was rolled back!`, txnError);
+            res.status(500).json({
+                success: false,
+                message: `Payment was captured by gateway, but subscription renewal failed. Please contact support with payment ID: ${razorpay_payment_id}`,
+                reconciliation_required: true,
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id
+            });
+        }
     }
     catch (error) {
         console.error("Error verifying renewal payment:", error);
         res.status(500).json({ success: false, message: "Internal server error", error: error.message });
     }
+    finally {
+        if (connection) {
+            connection.release();
+        }
+    }
 };
 exports.verifyAuthenticatedRenewalPayment = verifyAuthenticatedRenewalPayment;
 // ============ HANDLE CCAVENUE RENEWAL CALLBACK ============
 const handleCCAvenueRenewalCallback = async (req, res) => {
+    let connection = null;
     try {
         console.log('CCAvenue Renewal Callback received');
         const { encResp } = req.body;
@@ -271,25 +331,71 @@ const handleCCAvenueRenewalCallback = async (req, res) => {
             return;
         }
         if (orderStatus === 'Success') {
-            // Update payment record
-            await query(`
-        UPDATE vendor_payments SET
-          payment_status = 'completed',
-          gateway_payment_id = ?,
-          gateway_response = ?,
-          paid_at = CURRENT_TIMESTAMP,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE gateway_order_id = ? AND vendor_id = ?
-      `, [trackingId, JSON.stringify(decryptedData), orderId, vendorId]);
-            // Update subscription end date
-            const currentSub = await query("SELECT * FROM vendor_subscriptions WHERE vendor_id = ? ORDER BY subscription_end_date DESC LIMIT 1", [vendorId]);
-            if (currentSub.length > 0) {
-                const newEndDate = new Date(currentSub[0].subscription_end_date);
-                newEndDate.setMonth(newEndDate.getMonth() + 1);
-                await query("UPDATE vendor_subscriptions SET subscription_end_date = ?, updated_at = CURRENT_TIMESTAMP WHERE vendor_id = ? AND id = ?", [newEndDate, vendorId, currentSub[0].id]);
+            // Acquire dedicated connection for atomic post-capture transaction
+            connection = await new Promise((resolve, reject) => {
+                db.getConnection((err, conn) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(conn);
+                });
+            });
+            const queryConn = (sql, params = []) => {
+                return new Promise((resolve, reject) => {
+                    connection.query(sql, params, (err, results) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve(results);
+                    });
+                });
+            };
+            await new Promise((resolve, reject) => {
+                connection.beginTransaction((err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve();
+                });
+            });
+            try {
+                // 1. Update payment record
+                await queryConn(`
+          UPDATE vendor_payments SET
+            payment_status = 'completed',
+            gateway_payment_id = ?,
+            gateway_response = ?,
+            paid_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE gateway_order_id = ? AND vendor_id = ?
+        `, [trackingId, JSON.stringify(decryptedData), orderId, vendorId]);
+                // 2. Update subscription end date
+                const currentSub = await queryConn("SELECT * FROM vendor_subscriptions WHERE vendor_id = ? ORDER BY subscription_end_date DESC LIMIT 1", [vendorId]);
+                if (currentSub.length > 0) {
+                    const newEndDate = new Date(currentSub[0].subscription_end_date);
+                    newEndDate.setMonth(newEndDate.getMonth() + 1);
+                    await queryConn("UPDATE vendor_subscriptions SET subscription_end_date = ?, updated_at = CURRENT_TIMESTAMP WHERE vendor_id = ? AND id = ?", [newEndDate, vendorId, currentSub[0].id]);
+                }
+                // 3. Commit transaction
+                await new Promise((resolve, reject) => {
+                    connection.commit((err) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve();
+                    });
+                });
+                const frontendUrl = process.env.FRONTEND_URL || 'https://vivaaha.net';
+                res.redirect(`${frontendUrl}/vendor/renewal/success?order_id=${orderId}&tracking_id=${trackingId}&status=success`);
             }
-            const frontendUrl = process.env.FRONTEND_URL || 'https://vivaaha.net';
-            res.redirect(`${frontendUrl}/vendor/renewal/success?order_id=${orderId}&tracking_id=${trackingId}&status=success`);
+            catch (txnError) {
+                await new Promise((resolve) => {
+                    connection.rollback(() => resolve());
+                });
+                console.error(`[CRITICAL PAYMENT RECONCILIATION NEEDED] CCAvenue renewal payment was captured (OrderId: ${orderId}, TrackingId: ${trackingId}, Vendor: ${vendorId}), but DB transaction failed and was rolled back!`, txnError);
+                const frontendUrl = process.env.FRONTEND_URL || 'https://vivaaha.net';
+                res.redirect(`${frontendUrl}/vendor/renewal/failed?order_id=${orderId}&status=failed&message=${encodeURIComponent('Payment captured but renewal update failed. Support has been notified.')}`);
+            }
         }
         else {
             // Payment failed
@@ -309,6 +415,11 @@ const handleCCAvenueRenewalCallback = async (req, res) => {
         console.error("CCAvenue Renewal Callback Error:", error);
         const frontendUrl = process.env.FRONTEND_URL || 'https://vivaaha.net';
         res.redirect(`${frontendUrl}/vendor/renewal/failed?status=error&message=${encodeURIComponent('Server error occurred')}`);
+    }
+    finally {
+        if (connection) {
+            connection.release();
+        }
     }
 };
 exports.handleCCAvenueRenewalCallback = handleCCAvenueRenewalCallback;

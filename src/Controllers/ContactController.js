@@ -8,6 +8,7 @@ exports.sendAdminReply = sendAdminReply;
 exports.deleteContactMessage = deleteContactMessage;
 const utils = require("util");
 const EmailService_1 = require("./EmailService");
+const emailOutboxService_1 = require("../services/emailOutboxService");
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 // Submit Contact Form
@@ -36,27 +37,51 @@ async function submitContactForm(req, res) {
             message,
             submitted_at: new Date().toLocaleString()
         };
-        // Send notification email to admin
+        // Queue notification email to admin
         if (adminEmail) {
             try {
-                await EmailService_1.EmailService.sendTemplateEmail('contact_form_admin', adminEmail, variables, {
-                    fallbackSubject: `New Contact Form Submission: ${subject}`,
-                    fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h3>New Contact Form Submission</h3><p><strong>Name:</strong> ${full_name}</p><p><strong>Email:</strong> ${email}</p><p><strong>Phone:</strong> ${phone || 'Not provided'}</p><p><strong>Subject:</strong> ${subject}</p><p><strong>Message:</strong></p><p>${message}</p><hr><p><small>Submitted at: ${new Date().toLocaleString()}</small></p></div>`,
+                await (0, emailOutboxService_1.enqueueEmailOutboxJob)({
+                    jobType: "alert-email",
+                    eventKey: "contact_form_admin",
+                    deduplicationKey: `contact-form-admin-email:${result.insertId}`,
+                    payload: {
+                        kind: "alert-email",
+                        toEmail: adminEmail,
+                        recipientName: "Admin",
+                        templateKey: "contact_form_admin",
+                        variables,
+                        fallbackSubject: `New Contact Form Submission: ${subject}`,
+                        fallbackBody: `New contact form submission from ${full_name}. Subject: ${subject}. Message: ${message}`,
+                        fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h3>New Contact Form Submission</h3><p><strong>Name:</strong> ${full_name}</p><p><strong>Email:</strong> ${email}</p><p><strong>Phone:</strong> ${phone || 'Not provided'}</p><p><strong>Subject:</strong> ${subject}</p><p><strong>Message:</strong></p><p>${message}</p><hr><p><small>Submitted at: ${new Date().toLocaleString()}</small></p></div>`,
+                        meta: { event: "contact_form_admin", connectionId: result.insertId },
+                    },
                 });
             }
             catch (emailError) {
-                console.error('Failed to send contact admin notification:', emailError);
+                console.error('Failed to queue contact admin notification:', { contactId: result.insertId, message: emailError === null || emailError === void 0 ? void 0 : emailError.message });
             }
         }
-        // Send confirmation email to user
+        // Queue confirmation email to user
         try {
-            await EmailService_1.EmailService.sendTemplateEmail('contact_form_user', email, variables, {
-                fallbackSubject: 'Thank you for contacting Vivaaha',
-                fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h3>Thank you for contacting us!</h3><p>Dear ${full_name},</p><p>We have received your message and will get back to you within 24-48 hours.</p><p><strong>Your message:</strong></p><p>${message}</p><hr><p>Best regards,<br>Vivaaha Team</p></div>`,
+            await (0, emailOutboxService_1.enqueueEmailOutboxJob)({
+                jobType: "alert-email",
+                eventKey: "contact_form_user",
+                deduplicationKey: `contact-form-user-email:${result.insertId}`,
+                payload: {
+                    kind: "alert-email",
+                    toEmail: email,
+                    recipientName: full_name,
+                    templateKey: "contact_form_user",
+                    variables,
+                    fallbackSubject: 'Thank you for contacting Vivaaha',
+                    fallbackBody: `Dear ${full_name}, we have received your message and will get back to you within 24-48 hours.`,
+                    fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h3>Thank you for contacting us!</h3><p>Dear ${full_name},</p><p>We have received your message and will get back to you within 24-48 hours.</p><p><strong>Your message:</strong></p><p>${message}</p><hr><p>Best regards,<br>Vivaaha Team</p></div>`,
+                    meta: { event: "contact_form_user", connectionId: result.insertId },
+                },
             });
         }
         catch (emailError) {
-            console.error('Failed to send contact confirmation to user:', emailError);
+            console.error('Failed to queue contact confirmation to user:', { contactId: result.insertId, message: emailError === null || emailError === void 0 ? void 0 : emailError.message });
         }
         res.json({
             success: true,

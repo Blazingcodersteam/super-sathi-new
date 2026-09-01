@@ -502,6 +502,7 @@ async function createOrder(req, res) {
 // Verify Payment
 async function verifyPayment(req, res) {
     var _a;
+    let connection = null;
     try {
         const userId = req.user.user_id;
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
@@ -541,102 +542,10 @@ async function verifyPayment(req, res) {
                 message: "Payment verification failed"
             });
         }
+        // Fetch payment details from Razorpay
+        let payment;
         try {
-            // Fetch payment details from Razorpay
-            const payment = await razorpay.payments.fetch(razorpay_payment_id);
-            // Log successful payment
-            await query(`
-        INSERT INTO payment_logs (user_id, order_id, payment_id, signature, amount, method, status, gateway_response)
-        VALUES (?, ?, ?, ?, ?, ?, 'captured', ?)
-      `, [userId, razorpay_order_id, razorpay_payment_id, razorpay_signature, paymentOrder.amount, payment.method, JSON.stringify(payment)]);
-            // Update payment order status
-            await query(`
-        UPDATE payment_orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?
-      `, [razorpay_order_id]);
-            // Create payment record with GST details
-            const paymentResult = await query(`
-        INSERT INTO payments (user_id, plan_id, order_id, payment_id, razorpay_signature, amount, base_amount, cgst_amount, sgst_amount, igst_amount, gst_type, total_gst_amount, currency_id, payment_method, payment_status_id, payment_date, gateway_response)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, CURRENT_TIMESTAMP, ?)
-      `, [userId, paymentOrder.plan_id, razorpay_order_id, razorpay_payment_id, razorpay_signature, paymentOrder.amount, paymentOrder.base_amount, paymentOrder.cgst_amount, paymentOrder.sgst_amount, paymentOrder.igst_amount, paymentOrder.gst_type, paymentOrder.total_gst_amount, payment.method || 'test', JSON.stringify(payment || {})]);
-            // Get plan details for subscription
-            const [plan] = await query(`SELECT * FROM subscription_plans WHERE id = ?`, [paymentOrder.plan_id]);
-            if (plan) {
-                const startDate = new Date();
-                const endDate = new Date();
-                endDate.setMonth(endDate.getMonth() + plan.duration_months);
-                // Create subscription
-                const subscriptionResult = await query(`
-          INSERT INTO user_subscriptions (user_id, plan_id, payment_id, payment_order_id, start_date, end_date, activated_at, subscription_status_id, payment_status_id, is_active, plan_symbol)
-          VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, 1, 1, ?)
-        `, [userId, paymentOrder.plan_id, paymentResult.insertId, razorpay_order_id, startDate, endDate, plan.plan_name]);
-                // Log subscription activation
-                await query(`
-          INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, payment_id, notes)
-          VALUES (?, ?, ?, 'activated', 'active', ?, 'Subscription activated after successful payment')
-        `, [userId, subscriptionResult.insertId, paymentOrder.plan_id, razorpay_payment_id]);
-                // Process addons if any
-                if (paymentOrder.notes) {
-                    try {
-                        const orderNotes = JSON.parse(paymentOrder.notes);
-                        // If this is a plan change, cancel the old subscription now (after payment success)
-                        if (orderNotes.type === 'plan_change' && orderNotes.old_subscription_id) {
-                            await query(`
-                UPDATE user_subscriptions 
-                SET is_active = 0, subscription_status_id = 3, updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND user_id = ?
-              `, [orderNotes.old_subscription_id, userId]);
-                            await query(`
-                INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, old_status, new_status, notes)
-                VALUES (?, ?, ?, 'cancelled', 'active', 'cancelled', 'Cancelled after successful plan change payment')
-              `, [userId, orderNotes.old_subscription_id, paymentOrder.plan_id]);
-                        }
-                        if (orderNotes.addons && orderNotes.addons.length > 0) {
-                            for (const addon of orderNotes.addons) {
-                                await query(`
-                  INSERT INTO user_subscription_addons (user_id, subscription_id, addon_id, quantity, amount_paid)
-                  VALUES (?, ?, ?, 1, ?)
-                `, [userId, subscriptionResult.insertId, addon.id, addon.price]);
-                            }
-                        }
-                    }
-                    catch (e) {
-                        console.log('No addons to process');
-                    }
-                }
-            }
-            // Generate invoice details
-            const invoiceNumber = `INV-${new Date().getFullYear()}-${String(paymentResult.insertId).padStart(6, '0')}`;
-            const invoiceUrl = `${process.env.FRONTEND_URL || 'https://vivaaha.net'}/invoice/${invoiceNumber}`;
-            // Get payment data for PDF
-            const [paymentData] = await query(`
-        SELECT p.*, sp.plan_name, sp.duration_months,
-               up.first_name, up.last_name, u.email, u.phone
-        FROM payments p
-        LEFT JOIN subscription_plans sp ON p.plan_id = sp.id
-        LEFT JOIN users u ON p.user_id = u.id
-        LEFT JOIN user_profiles up ON p.user_id = up.user_id
-        WHERE p.id = ?
-      `, [paymentResult.insertId]);
-            paymentData.invoice_number = invoiceNumber;
-            const pdfUrl = await generateInvoicePDF(paymentData);
-            // Update payment with invoice details
-            await query(`
-        UPDATE payments SET invoice_number = ?, invoice_url = ?, invoice_pdf_url = ? WHERE id = ?
-      `, [invoiceNumber, invoiceUrl, pdfUrl, paymentResult.insertId]);
-            res.json({
-                success: true,
-                message: "Payment verified and subscription activated successfully",
-                data: {
-                    payment_id: razorpay_payment_id,
-                    order_id: razorpay_order_id,
-                    amount: paymentOrder.amount,
-                    plan_name: plan.plan_name,
-                    duration: plan.duration_months,
-                    invoice_number: invoiceNumber,
-                    invoice_url: invoiceUrl,
-                    invoice_pdf_url: pdfUrl
-                }
-            });
+            payment = await razorpay.payments.fetch(razorpay_payment_id);
         }
         catch (razorpayError) {
             console.error("Razorpay API Error:", razorpayError);
@@ -648,15 +557,213 @@ async function verifyPayment(req, res) {
             await query(`
         UPDATE payment_orders SET status = 'failed' WHERE order_id = ?
       `, [razorpay_order_id]);
-            res.status(500).json({
+            return res.status(500).json({
                 success: false,
                 message: "Payment verification failed due to gateway error"
             });
         }
+        if (payment.status !== 'captured') {
+            return res.status(400).json({
+                success: false,
+                message: `Payment is not captured. Current status: ${payment.status}`
+            });
+        }
+        // Acquire dedicated connection for atomic post-capture transaction
+        connection = await new Promise((resolve, reject) => {
+            db.getConnection((err, conn) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve(conn);
+            });
+        });
+        const queryConn = (sql, params = []) => {
+            return new Promise((resolve, reject) => {
+                connection.query(sql, params, (err, results) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(results);
+                });
+            });
+        };
+        await new Promise((resolve, reject) => {
+            connection.beginTransaction((err) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve();
+            });
+        });
+        let paymentInsertId;
+        let invoiceNumber = '';
+        let invoiceUrl = '';
+        let pdfUrl = '';
+        let planData = null;
+        try {
+            // 1. Log successful payment
+            await queryConn(`
+        INSERT INTO payment_logs (user_id, order_id, payment_id, signature, amount, method, status, gateway_response)
+        VALUES (?, ?, ?, ?, ?, ?, 'captured', ?)
+      `, [userId, razorpay_order_id, razorpay_payment_id, razorpay_signature, paymentOrder.amount, payment.method, JSON.stringify(payment)]);
+            // 2. Update payment order status
+            await queryConn(`
+        UPDATE payment_orders SET status = 'paid', updated_at = CURRENT_TIMESTAMP WHERE order_id = ?
+      `, [razorpay_order_id]);
+            // 3. Create payment record with GST details
+            const paymentResult = await queryConn(`
+        INSERT INTO payments (user_id, plan_id, order_id, payment_id, razorpay_signature, amount, base_amount, cgst_amount, sgst_amount, igst_amount, gst_type, total_gst_amount, currency_id, payment_method, payment_status_id, payment_date, gateway_response)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, CURRENT_TIMESTAMP, ?)
+      `, [userId, paymentOrder.plan_id, razorpay_order_id, razorpay_payment_id, razorpay_signature, paymentOrder.amount, paymentOrder.base_amount, paymentOrder.cgst_amount, paymentOrder.sgst_amount, paymentOrder.igst_amount, paymentOrder.gst_type, paymentOrder.total_gst_amount, payment.method || 'test', JSON.stringify(payment || {})]);
+            paymentInsertId = paymentResult.insertId;
+            // 4. Get plan details for subscription
+            const [plan] = await queryConn(`SELECT * FROM subscription_plans WHERE id = ?`, [paymentOrder.plan_id]);
+            planData = plan;
+            if (plan) {
+                const startDate = new Date();
+                const endDate = new Date();
+                endDate.setMonth(endDate.getMonth() + plan.duration_months);
+                // 5. Create user subscription
+                const subscriptionResult = await queryConn(`
+          INSERT INTO user_subscriptions (user_id, plan_id, payment_id, payment_order_id, start_date, end_date, activated_at, subscription_status_id, payment_status_id, is_active, plan_symbol)
+          VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, 1, 1, ?)
+        `, [userId, paymentOrder.plan_id, paymentInsertId, razorpay_order_id, startDate, endDate, plan.plan_name]);
+                // 6. Log subscription activation
+                await queryConn(`
+          INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, payment_id, notes)
+          VALUES (?, ?, ?, 'activated', 'active', ?, 'Subscription activated after successful payment')
+        `, [userId, subscriptionResult.insertId, paymentOrder.plan_id, razorpay_payment_id]);
+                // 7. Process addons & plan change if any
+                if (paymentOrder.notes) {
+                    try {
+                        const orderNotes = JSON.parse(paymentOrder.notes);
+                        // If this is a plan change, cancel the old subscription now
+                        if (orderNotes.type === 'plan_change' && orderNotes.old_subscription_id) {
+                            await queryConn(`
+                UPDATE user_subscriptions 
+                SET is_active = 0, subscription_status_id = 3, updated_at = CURRENT_TIMESTAMP 
+                WHERE id = ? AND user_id = ?
+              `, [orderNotes.old_subscription_id, userId]);
+                            await queryConn(`
+                INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, old_status, new_status, notes)
+                VALUES (?, ?, ?, 'cancelled', 'active', 'cancelled', 'Cancelled after successful plan change payment')
+              `, [userId, orderNotes.old_subscription_id, paymentOrder.plan_id]);
+                        }
+                        if (orderNotes.addons && orderNotes.addons.length > 0) {
+                            for (const addon of orderNotes.addons) {
+                                await queryConn(`
+                  INSERT INTO user_subscription_addons (user_id, subscription_id, addon_id, quantity, amount_paid)
+                  VALUES (?, ?, ?, 1, ?)
+                `, [userId, subscriptionResult.insertId, addon.id, addon.price]);
+                            }
+                        }
+                    }
+                    catch (e) {
+                        console.log('No addons to process or JSON parse error:', e);
+                    }
+                }
+            }
+            // 8. Generate invoice details and update payment record within transaction
+            invoiceNumber = `INV-${new Date().getFullYear()}-${String(paymentInsertId).padStart(6, '0')}`;
+            invoiceUrl = `${process.env.FRONTEND_URL || 'https://vivaaha.net'}/invoice/${invoiceNumber}`;
+            await queryConn(`
+        UPDATE payments SET invoice_number = ?, invoice_url = ? WHERE id = ?
+      `, [invoiceNumber, invoiceUrl, paymentInsertId]);
+            // 9. COMMIT TRANSACTION
+            await new Promise((resolve, reject) => {
+                connection.commit((err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve();
+                });
+            });
+        }
+        catch (txnError) {
+            // ROLLBACK on DB failure
+            await new Promise((resolve) => {
+                connection.rollback(() => resolve());
+            });
+            // CRITICAL RECONCILIATION LOG: Gateway captured money but DB failed
+            console.error(`[CRITICAL PAYMENT RECONCILIATION NEEDED] Razorpay payment captured, but DB transaction failed and rolled back!`, {
+                gateway: 'razorpay',
+                userId,
+                razorpay_order_id,
+                razorpay_payment_id,
+                amount: paymentOrder.amount,
+                plan_id: paymentOrder.plan_id,
+                error: txnError.message || txnError
+            });
+            // Record reconciliation alert in payment_logs on independent connection
+            try {
+                await query(`
+          INSERT INTO payment_logs (user_id, order_id, payment_id, amount, status, error_code, error_description, gateway_response)
+          VALUES (?, ?, ?, ?, 'reconciliation_required', 'DB_TXN_FAILED', ?, ?)
+        `, [
+                    userId,
+                    razorpay_order_id,
+                    razorpay_payment_id,
+                    paymentOrder.amount,
+                    `Gateway captured payment but DB transaction failed: ${txnError.message}`,
+                    JSON.stringify(payment || {})
+                ]);
+            }
+            catch (logErr) {
+                console.error("Failed to log reconciliation alert:", logErr);
+            }
+            return res.status(500).json({
+                success: false,
+                message: `Payment was captured by gateway, but subscription activation encountered an error. Please contact support with payment ID: ${razorpay_payment_id}`,
+                reconciliation_required: true,
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id
+            });
+        }
+        // Post-commit PDF Generation (does not block or jeopardize subscription activation)
+        try {
+            const [paymentData] = await query(`
+        SELECT p.*, sp.plan_name, sp.duration_months,
+               up.first_name, up.last_name, u.email, u.phone
+        FROM payments p
+        LEFT JOIN subscription_plans sp ON p.plan_id = sp.id
+        LEFT JOIN users u ON p.user_id = u.id
+        LEFT JOIN user_profiles up ON p.user_id = up.user_id
+        WHERE p.id = ?
+      `, [paymentInsertId]);
+            if (paymentData) {
+                paymentData.invoice_number = invoiceNumber;
+                pdfUrl = await generateInvoicePDF(paymentData);
+                await query(`
+          UPDATE payments SET invoice_pdf_url = ? WHERE id = ?
+        `, [pdfUrl, paymentInsertId]);
+            }
+        }
+        catch (pdfErr) {
+            console.error("Invoice PDF generation error (subscription already active):", pdfErr);
+        }
+        res.json({
+            success: true,
+            message: "Payment verified and subscription activated successfully",
+            data: {
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id,
+                amount: paymentOrder.amount,
+                plan_name: (planData === null || planData === void 0 ? void 0 : planData.plan_name) || '',
+                duration: (planData === null || planData === void 0 ? void 0 : planData.duration_months) || 0,
+                invoice_number: invoiceNumber,
+                invoice_url: invoiceUrl,
+                invoice_pdf_url: pdfUrl
+            }
+        });
     }
     catch (error) {
         console.error("Verify Payment Error:", error);
         res.status(500).json({ success: false, message: "Server error" });
+    }
+    finally {
+        if (connection) {
+            connection.release();
+        }
     }
 }
 // Get Payment History
@@ -1059,6 +1166,7 @@ async function processRefund(req, res) {
             });
         }
         if (action === 'approve') {
+            let refundConnection = null;
             try {
                 const refund = await razorpay.payments.refund(refundRequest.payment_id, {
                     amount: Math.round(refundRequest.refund_amount * 100),
@@ -1067,19 +1175,63 @@ async function processRefund(req, res) {
                         admin_notes: admin_notes || 'Approved by admin'
                     }
                 });
-                await query(`
-          UPDATE refund_requests 
-          SET refund_status = 'processed', 
-              admin_notes = ?, 
-              razorpay_refund_id = ?,
-              processed_at = CURRENT_TIMESTAMP
-          WHERE id = ?
-        `, [admin_notes || 'Refund processed successfully', refund.id, refund_request_id]);
-                // Log subscription refund
-                await query(`
-          INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, notes)
-          VALUES (?, ?, ?, 'refunded', 'refunded', 'Subscription refunded by admin')
-        `, [refundRequest.user_id, refundRequest.subscription_id, refundRequest.plan_id]);
+                // Start atomic transaction for refund DB updates
+                refundConnection = await new Promise((resolve, reject) => {
+                    db.getConnection((err, conn) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve(conn);
+                    });
+                });
+                const queryRefundConn = (sql, params = []) => {
+                    return new Promise((resolve, reject) => {
+                        refundConnection.query(sql, params, (err, results) => {
+                            if (err)
+                                reject(err);
+                            else
+                                resolve(results);
+                        });
+                    });
+                };
+                await new Promise((resolve, reject) => {
+                    refundConnection.beginTransaction((err) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve();
+                    });
+                });
+                try {
+                    await queryRefundConn(`
+            UPDATE refund_requests 
+            SET refund_status = 'processed', 
+                admin_notes = ?, 
+                razorpay_refund_id = ?,
+                processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `, [admin_notes || 'Refund processed successfully', refund.id, refund_request_id]);
+                    // Log subscription refund
+                    await queryRefundConn(`
+            INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, notes)
+            VALUES (?, ?, ?, 'refunded', 'refunded', 'Subscription refunded by admin')
+          `, [refundRequest.user_id, refundRequest.subscription_id, refundRequest.plan_id]);
+                    await new Promise((resolve, reject) => {
+                        refundConnection.commit((err) => {
+                            if (err)
+                                reject(err);
+                            else
+                                resolve();
+                        });
+                    });
+                }
+                catch (dbErr) {
+                    await new Promise((resolve) => {
+                        refundConnection.rollback(() => resolve());
+                    });
+                    console.error("[CRITICAL] Refund issued on Razorpay, but DB update failed:", dbErr);
+                    throw dbErr;
+                }
                 res.json({
                     success: true,
                     message: "Refund processed successfully",
@@ -1102,6 +1254,11 @@ async function processRefund(req, res) {
                     success: false,
                     message: "Failed to process refund through payment gateway"
                 });
+            }
+            finally {
+                if (refundConnection) {
+                    refundConnection.release();
+                }
             }
         }
         else {

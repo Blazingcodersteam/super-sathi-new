@@ -187,9 +187,6 @@ async function sendOtp(req, res) {
         return res.json({
             success: true,
             message: "OTP sent successfully",
-            otp: otp,
-            otp_inserted: Boolean(insertedOtp),
-            sms: sms
         });
     }
     catch (error) {

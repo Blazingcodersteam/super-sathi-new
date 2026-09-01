@@ -49,8 +49,7 @@ async function sendOTP(req, res) {
         }
         res.json({
             success: true,
-            message: isEmail ? "OTP sent to your email" : "OTP generated for phone",
-            otp: otp, // Return OTP in response for testing (remove in production)
+            message: isEmail ? "OTP sent to your email" : "OTP sent successfully",
         });
     }
     catch (error) {

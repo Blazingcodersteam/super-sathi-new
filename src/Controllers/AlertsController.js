@@ -18,7 +18,7 @@ exports.createConnectDeclinedAlert = createConnectDeclinedAlert;
 exports.createCallAlert = createCallAlert;
 const utils = require("util");
 const fcm_1 = require("../utils/fcm");
-const EmailService_1 = require("./EmailService");
+const emailOutboxService_1 = require("../services/emailOutboxService");
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
 function connectPerfNow() {
@@ -45,7 +45,7 @@ function logConnectPerf(perf, label, start, extra = "") {
     const suffix = extra ? ` ${extra}` : "";
     console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
 }
-// ── Alert Type IDs (matches alert_types_master) ──────────────────────────────
+// â”€â”€ Alert Type IDs (matches alert_types_master) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 const ALERT = {
     PROFILE_LIKE: 1,
     PROFILE_MATCH: 2,
@@ -65,7 +65,7 @@ const ALERT = {
     PROFILE_VIEW_NEW: 16,
     SHORTLIST_ADDED: 17,
 };
-// ── Translation helper ────────────────────────────────────────────────────────
+// â”€â”€ Translation helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getTranslation(textKey, lang = 'en') {
     try {
         const [translation] = await query(`SELECT en FROM translations WHERE text_key = ? AND status = 1 LIMIT 1`, [textKey]);
@@ -76,30 +76,42 @@ async function getTranslation(textKey, lang = 'en') {
         return textKey;
     }
 }
-// ── Reusable email helper ────────────────────────────────────────────────────
-async function sendAlertEmail(userId, templateKey, variables, fallbackSubject, fallbackBody, perf = null) {
-    var _a;
+// â”€â”€ Reusable email helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+async function sendAlertEmail(userId, templateKey, variables, fallbackSubject, fallbackBody, perf = null, deduplicationKey, meta = {}) {
+    const emailJobStart = perf ? connectPerfNow() : 0;
     try {
-        const userQueryStart = perf ? connectPerfNow() : 0;
-        const [userRow] = await query(`SELECT u.email, up.first_name FROM users u
-       JOIN user_profiles up ON u.id = up.user_id WHERE u.id = ?`, [userId]);
-        logConnectPerf(perf, "email-user-db-query", userQueryStart);
-        if (!(userRow === null || userRow === void 0 ? void 0 : userRow.email)) {
-            logConnectPerf(perf, "email", connectPerfNow(), "(no-email-address)");
+        if (!deduplicationKey) {
+            console.error(`[Alert] Email outbox missing deduplication key [${templateKey}]`, { userId });
+            logConnectPerf(perf, "email-outbox-insert", emailJobStart, "(missing-deduplication-key)");
             return;
         }
-        const vars = Object.assign({ user_name: (_a = userRow.first_name) !== null && _a !== void 0 ? _a : 'User' }, variables);
-        const emailStart = perf ? connectPerfNow() : 0;
-        await EmailService_1.EmailService.sendTemplateEmail(templateKey, userRow.email, vars, {
-            fallbackSubject,
-            fallbackHtml: defaultEmailHtml(fallbackSubject, fallbackBody),
-            fallbackText: fallbackBody,
-            perf,
+        const job = await (0, emailOutboxService_1.enqueueEmailOutboxJob)({
+            jobType: "alert-email",
+            eventKey: templateKey,
+            deduplicationKey,
+            payload: {
+                kind: "alert-email",
+                userId,
+                templateKey,
+                variables,
+                fallbackSubject,
+                fallbackBody,
+                meta: Object.assign({ event: templateKey, receiverUserId: userId }, meta),
+            },
         });
-        logConnectPerf(perf, "email", emailStart);
+        logConnectPerf(perf, "email-outbox-insert", emailJobStart, `(outbox=${job.id} duplicate=${job.duplicate})`);
+        logConnectPerf(perf, "email", emailJobStart, "(outbox queued)");
+        if (!perf && job.duplicate) {
+            console.log(`[EMAIL-OUTBOX] duplicate email job event=${templateKey} job=${job.id}`);
+        }
     }
     catch (err) {
-        console.error(`[Alert] Email error [${templateKey}]:`, err);
+        logConnectPerf(perf, "email-outbox-insert", emailJobStart, "(failed)");
+        console.error(`[Alert] Email outbox error [${templateKey}]:`, {
+            userId,
+            deduplicationKey,
+            message: err === null || err === void 0 ? void 0 : err.message,
+        });
     }
 }
 function defaultEmailHtml(title, body) {
@@ -122,12 +134,12 @@ function defaultEmailHtml(title, body) {
     </div>
   </div>`;
 }
-// ── Internal helper ───────────────────────────────────────────────────────────
+// â”€â”€ Internal helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function createAlert(userId, alertTypeId, fromUserId, title, message, messageParams = {}, dataPayload = null, perf = null) {
     var _a;
     try {
         const insertStart = perf ? connectPerfNow() : 0;
-        await query(`INSERT INTO user_alerts (user_id, alert_type_id, from_user_id, title, message, data_payload)
+        const result = await query(`INSERT INTO user_alerts (user_id, alert_type_id, from_user_id, title, message, data_payload)
        VALUES (?, ?, ?, ?, ?, ?)`, [userId, alertTypeId, fromUserId, title, message,
             dataPayload ? JSON.stringify(dataPayload) : null]);
         logConnectPerf(perf, "notification-insert-db-query", insertStart);
@@ -160,9 +172,11 @@ async function createAlert(userId, alertTypeId, fromUserId, title, message, mess
                 console.error('[Alert] FCM push error:', (_a = fcmErr === null || fcmErr === void 0 ? void 0 : fcmErr.message) !== null && _a !== void 0 ? _a : fcmErr);
             }
         }
+        return (result === null || result === void 0 ? void 0 : result.insertId) || null;
     }
     catch (error) {
         console.error("createAlert Error:", error);
+        return null;
     }
 }
 async function getSenderInfo(senderId, perf = null) {
@@ -181,7 +195,7 @@ async function getSenderInfo(senderId, perf = null) {
         displayName: (_b = p === null || p === void 0 ? void 0 : p.display_name) !== null && _b !== void 0 ? _b : "Someone"
     };
 }
-// ── Chat alerts (used by chatRoutes) ─────────────────────────────────────────
+// â”€â”€ Chat alerts (used by chatRoutes) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function getAlerts(req, res) {
     try {
         const userId = req.user.user_id;
@@ -280,68 +294,87 @@ async function getAlertStats(req, res) {
         res.status(500).json({ success: false, message: "Server error" });
     }
 }
-// ── Notification creators (called from other controllers) ─────────────────────
+// â”€â”€ Notification creators (called from other controllers) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 async function createProfileLikeAlert(likedUserId, likerUserId) {
     const senderInfo = await getSenderInfo(likerUserId);
-    await createAlert(likedUserId, ALERT.PROFILE_LIKE, likerUserId, `${senderInfo.displayName} liked your profile`, `${senderInfo.displayName} has liked your profile.`, {}, { action: 'profile_like', sender_id: likerUserId });
-    await sendAlertEmail(likedUserId, 'profile_like', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} liked your profile`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has liked your profile. Check out their profile and see if it's a match!`);
+    const alertId = await createAlert(likedUserId, ALERT.PROFILE_LIKE, likerUserId, `${senderInfo.displayName} liked your profile`, `${senderInfo.displayName} has liked your profile.`, {}, { action: 'profile_like', sender_id: likerUserId });
+    if (alertId)
+        await sendAlertEmail(likedUserId, 'profile_like', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} liked your profile`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has liked your profile. Check out their profile and see if it's a match!`, null, (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('profile_like', alertId), { senderUserId: likerUserId, alertId });
 }
 async function createProfileViewAlert(viewedUserId, viewerUserId) {
     const senderInfo = await getSenderInfo(viewerUserId);
-    await createAlert(viewedUserId, ALERT.PROFILE_VIEW, viewerUserId, `${senderInfo.displayName} viewed your profile`, `${senderInfo.displayName} has viewed your profile.`, {}, { action: 'profile_view', sender_id: viewerUserId });
-    await sendAlertEmail(viewedUserId, 'profile_view', { viewer_name: senderInfo.displayName }, `${senderInfo.displayName} viewed your profile`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has viewed your profile. Visit their profile to see if you're a match!`);
+    const alertId = await createAlert(viewedUserId, ALERT.PROFILE_VIEW, viewerUserId, `${senderInfo.displayName} viewed your profile`, `${senderInfo.displayName} has viewed your profile.`, {}, { action: 'profile_view', sender_id: viewerUserId });
+    if (alertId)
+        await sendAlertEmail(viewedUserId, 'profile_view', { viewer_name: senderInfo.displayName }, `${senderInfo.displayName} viewed your profile`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has viewed your profile. Visit their profile to see if you're a match!`, null, (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('profile_view', alertId), { senderUserId: viewerUserId, alertId });
 }
 // Interest received (alert_type_id = 4)
-async function createInterestAlert(receiverUserId, senderUserId) {
+async function createInterestAlert(receiverUserId, senderUserId, interestId) {
     const senderInfo = await getSenderInfo(senderUserId);
-    await createAlert(receiverUserId, ALERT.INTEREST_RECEIVED, senderUserId, `${senderInfo.displayName} sent you an interest`, `${senderInfo.displayName} is interested in your profile. Check it out!`, {}, { action: 'interest_received', sender_id: senderUserId });
-    await sendAlertEmail(receiverUserId, 'interest_received', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} sent you an interest`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> is interested in your profile. Accept their interest to start connecting!`);
+    const alertId = await createAlert(receiverUserId, ALERT.INTEREST_RECEIVED, senderUserId, `${senderInfo.displayName} sent you an interest`, `${senderInfo.displayName} is interested in your profile. Check it out!`, {}, { action: 'interest_received', sender_id: senderUserId });
+    const deduplicationKey = interestId ? `interest-sent-email:${interestId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('interest_received', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(receiverUserId, 'interest_received', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} sent you an interest`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> is interested in your profile. Accept their interest to start connecting!`, null, deduplicationKey, { senderUserId, receiverUserId, interestId, alertId });
 }
-// Interest accepted (alert_type_id = 11) — notify original sender
-async function createInterestAcceptedAlert(senderUserId, acceptorUserId) {
+// Interest accepted (alert_type_id = 11) - notify original sender
+async function createInterestAcceptedAlert(senderUserId, acceptorUserId, interestId) {
     const acceptorInfo = await getSenderInfo(acceptorUserId);
-    await createAlert(senderUserId, ALERT.INTEREST_ACCEPTED, acceptorUserId, `${acceptorInfo.displayName} accepted your interest`, `Great news! ${acceptorInfo.displayName} has accepted your interest.`, {}, { action: 'interest_accepted', acceptor_id: acceptorUserId });
-    await sendAlertEmail(senderUserId, 'interest_accepted', { acceptor_name: acceptorInfo.displayName }, `${acceptorInfo.displayName} accepted your interest! 🎉`, `Great news, {{user_name}}! <strong>${acceptorInfo.displayName}</strong> has accepted your interest. You can now send a connect request!`);
+    const alertId = await createAlert(senderUserId, ALERT.INTEREST_ACCEPTED, acceptorUserId, `${acceptorInfo.displayName} accepted your interest`, `Great news! ${acceptorInfo.displayName} has accepted your interest.`, {}, { action: 'interest_accepted', acceptor_id: acceptorUserId });
+    const deduplicationKey = interestId ? `interest-accepted-email:${interestId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('interest_accepted', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(senderUserId, 'interest_accepted', { acceptor_name: acceptorInfo.displayName }, `${acceptorInfo.displayName} accepted your interest!`, `Great news, {{user_name}}! <strong>${acceptorInfo.displayName}</strong> has accepted your interest. You can now send a connect request!`, null, deduplicationKey, { senderUserId, receiverUserId: senderUserId, acceptorUserId, interestId, alertId });
 }
-// Interest declined (alert_type_id = 12) — notify original sender
-async function createInterestDeclinedAlert(senderUserId, declinerUserId) {
+// Interest declined (alert_type_id = 12) - notify original sender
+async function createInterestDeclinedAlert(senderUserId, declinerUserId, interestId) {
     const declinerInfo = await getSenderInfo(declinerUserId);
-    await createAlert(senderUserId, ALERT.INTEREST_DECLINED, declinerUserId, `${declinerInfo.displayName} declined your interest`, `${declinerInfo.displayName} has declined your interest request.`, {}, { action: 'interest_declined', decliner_id: declinerUserId });
-    await sendAlertEmail(senderUserId, 'interest_declined', { decliner_name: declinerInfo.displayName }, `Your interest was declined`, `{{user_name}}, <strong>${declinerInfo.displayName}</strong> has declined your interest. Don't give up — there are many more profiles waiting for you!`);
+    const alertId = await createAlert(senderUserId, ALERT.INTEREST_DECLINED, declinerUserId, `${declinerInfo.displayName} declined your interest`, `${declinerInfo.displayName} has declined your interest request.`, {}, { action: 'interest_declined', decliner_id: declinerUserId });
+    const deduplicationKey = interestId ? `interest-rejected-email:${interestId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('interest_declined', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(senderUserId, 'interest_declined', { decliner_name: declinerInfo.displayName }, `Your interest was declined`, `{{user_name}}, <strong>${declinerInfo.displayName}</strong> has declined your interest. Don't give up - there are many more profiles waiting for you!`, null, deduplicationKey, { senderUserId, receiverUserId: senderUserId, declinerUserId, interestId, alertId });
 }
 async function createPhotoRequestAlert(receiverUserId, senderUserId) {
     const senderInfo = await getSenderInfo(senderUserId);
-    await createAlert(receiverUserId, ALERT.CONTACT_REQUEST, senderUserId, `${senderInfo.displayName} sent a photo request`, `${senderInfo.displayName} has requested to view your photos.`, {}, { action: 'photo_request', sender_id: senderUserId });
-    await sendAlertEmail(receiverUserId, 'photo_request', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} requested to view your photos`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has requested to view your photos. Open the app to approve or decline.`);
+    const alertId = await createAlert(receiverUserId, ALERT.CONTACT_REQUEST, senderUserId, `${senderInfo.displayName} sent a photo request`, `${senderInfo.displayName} has requested to view your photos.`, {}, { action: 'photo_request', sender_id: senderUserId });
+    if (alertId)
+        await sendAlertEmail(receiverUserId, 'photo_request', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} requested to view your photos`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has requested to view your photos. Open the app to approve or decline.`, null, (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('photo_request', alertId), { senderUserId, receiverUserId, alertId });
 }
-async function createShortlistAlert(shortlistedUserId, shortlisterUserId) {
+async function createShortlistAlert(shortlistedUserId, shortlisterUserId, shortlistActionId) {
     const shortlisterInfo = await getSenderInfo(shortlisterUserId);
-    await createAlert(shortlistedUserId, ALERT.SHORTLIST_ADDED, shortlisterUserId, `${shortlisterInfo.displayName} shortlisted you`, `${shortlisterInfo.displayName} has added you to their shortlist.`, {}, { action: 'shortlist_added', shortlister_id: shortlisterUserId });
-    await sendAlertEmail(shortlistedUserId, 'shortlist_added', { shortlister_name: shortlisterInfo.displayName }, `${shortlisterInfo.displayName} added you to their shortlist`, `{{user_name}}, <strong>${shortlisterInfo.displayName}</strong> has added you to their shortlist. This could be the beginning of something special!`);
+    const alertId = await createAlert(shortlistedUserId, ALERT.SHORTLIST_ADDED, shortlisterUserId, `${shortlisterInfo.displayName} shortlisted you`, `${shortlisterInfo.displayName} has added you to their shortlist.`, {}, { action: 'shortlist_added', shortlister_id: shortlisterUserId });
+    const deduplicationKey = shortlistActionId ? `shortlist-email:${shortlistActionId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('shortlist_added', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(shortlistedUserId, 'shortlist_added', { shortlister_name: shortlisterInfo.displayName }, `${shortlisterInfo.displayName} added you to their shortlist`, `{{user_name}}, <strong>${shortlisterInfo.displayName}</strong> has added you to their shortlist. This could be the beginning of something special!`, null, deduplicationKey, { senderUserId: shortlisterUserId, receiverUserId: shortlistedUserId, shortlistActionId, alertId });
 }
 // Connect request received (alert_type_id = 13)
-async function createConnectNowAlert(receiverUserId, senderUserId, perf = null) {
+async function createConnectNowAlert(receiverUserId, senderUserId, perf = null, connectionRequestId) {
     const alertStart = perf ? connectPerfNow() : 0;
     const senderInfo = await getSenderInfo(senderUserId, perf);
     const createAlertStart = perf ? connectPerfNow() : 0;
-    await createAlert(receiverUserId, ALERT.CONNECT_REQUEST, senderUserId, `${senderInfo.displayName} wants to connect`, `${senderInfo.displayName} has sent you a connect request.`, {}, { action: 'connect_request', sender_id: senderUserId }, perf);
+    const alertId = await createAlert(receiverUserId, ALERT.CONNECT_REQUEST, senderUserId, `${senderInfo.displayName} wants to connect`, `${senderInfo.displayName} has sent you a connect request.`, {}, { action: 'connect_request', sender_id: senderUserId }, perf);
     logConnectPerf(perf, "create-alert", createAlertStart);
-    await sendAlertEmail(receiverUserId, 'connect_request', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} wants to connect with you`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has sent you a connect request. Accept to start chatting!`, perf);
+    const deduplicationKey = connectionRequestId
+        ? (0, emailOutboxService_1.getConnectRequestEmailDeduplicationKey)(connectionRequestId)
+        : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('connect_request', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(receiverUserId, 'connect_request', { sender_name: senderInfo.displayName }, `${senderInfo.displayName} wants to connect with you`, `{{user_name}}, <strong>${senderInfo.displayName}</strong> has sent you a connect request. Accept to start chatting!`, perf, deduplicationKey, { senderUserId, receiverUserId, connectionId: connectionRequestId || (perf === null || perf === void 0 ? void 0 : perf.connectionId), alertId });
     logConnectPerf(perf, "create-connect-now-alert", alertStart);
 }
-// Connect accepted (alert_type_id = 14) — notify original sender
-async function createConnectAcceptedAlert(senderUserId, acceptorUserId) {
+// Connect accepted (alert_type_id = 14) - notify original sender
+async function createConnectAcceptedAlert(senderUserId, acceptorUserId, connectionRequestId) {
     const acceptorInfo = await getSenderInfo(acceptorUserId);
-    await createAlert(senderUserId, ALERT.CONNECT_ACCEPTED, acceptorUserId, `${acceptorInfo.displayName} accepted your connect request`, `You are now connected with ${acceptorInfo.displayName}. Start chatting!`, {}, { action: 'connect_accepted', acceptor_id: acceptorUserId });
-    await sendAlertEmail(senderUserId, 'connect_accepted', { acceptor_name: acceptorInfo.displayName }, `${acceptorInfo.displayName} accepted your connect request! 🎉`, `{{user_name}}, you are now connected with <strong>${acceptorInfo.displayName}</strong>. Open the app and start chatting!`);
+    const alertId = await createAlert(senderUserId, ALERT.CONNECT_ACCEPTED, acceptorUserId, `${acceptorInfo.displayName} accepted your connect request`, `You are now connected with ${acceptorInfo.displayName}. Start chatting!`, {}, { action: 'connect_accepted', acceptor_id: acceptorUserId });
+    const deduplicationKey = connectionRequestId ? `connect-accepted-email:${connectionRequestId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('connect_accepted', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(senderUserId, 'connect_accepted', { acceptor_name: acceptorInfo.displayName }, `${acceptorInfo.displayName} accepted your connect request!`, `{{user_name}}, you are now connected with <strong>${acceptorInfo.displayName}</strong>. Open the app and start chatting!`, null, deduplicationKey, { senderUserId, receiverUserId: senderUserId, acceptorUserId, connectionId: connectionRequestId, alertId });
 }
-// Connect declined (alert_type_id = 15) — notify original sender
-async function createConnectDeclinedAlert(senderUserId, declinerUserId) {
+// Connect declined (alert_type_id = 15) - notify original sender
+async function createConnectDeclinedAlert(senderUserId, declinerUserId, connectionRequestId) {
     const declinerInfo = await getSenderInfo(declinerUserId);
-    await createAlert(senderUserId, ALERT.CONNECT_DECLINED, declinerUserId, `${declinerInfo.displayName} declined your connect request`, `${declinerInfo.displayName} has declined your connect request.`, {}, { action: 'connect_declined', decliner_id: declinerUserId });
-    await sendAlertEmail(senderUserId, 'connect_declined', { decliner_name: declinerInfo.displayName }, `Your connect request was declined`, `{{user_name}}, <strong>${declinerInfo.displayName}</strong> has declined your connect request. Keep exploring — your perfect match is out there!`);
+    const alertId = await createAlert(senderUserId, ALERT.CONNECT_DECLINED, declinerUserId, `${declinerInfo.displayName} declined your connect request`, `${declinerInfo.displayName} has declined your connect request.`, {}, { action: 'connect_declined', decliner_id: declinerUserId });
+    const deduplicationKey = connectionRequestId ? `connect-rejected-email:${connectionRequestId}` : (alertId ? (0, emailOutboxService_1.getAlertEmailDeduplicationKey)('connect_declined', alertId) : undefined);
+    if (alertId)
+        await sendAlertEmail(senderUserId, 'connect_declined', { decliner_name: declinerInfo.displayName }, `Your connect request was declined`, `{{user_name}}, <strong>${declinerInfo.displayName}</strong> has declined your connect request. Keep exploring - your perfect match is out there!`, null, deduplicationKey, { senderUserId, receiverUserId: senderUserId, declinerUserId, connectionId: connectionRequestId, alertId });
 }
-// Call alerts (alert_type_ids 6-10) — called from CallController
+// Call alerts (alert_type_ids 6-10) - called from CallController
 async function createCallAlert(userId, alertTypeId, fromUserId, title, message, messageParams = {}, payload = null) {
     await createAlert(userId, alertTypeId, fromUserId, title, message, {}, payload);
 }

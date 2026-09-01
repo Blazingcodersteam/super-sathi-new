@@ -316,8 +316,7 @@ async function sendNameUpdateOTP(req, res) {
             });
             res.json({
                 success: true,
-                message: "OTP sent successfully to your email",
-                otp: otp
+                message: "OTP sent successfully to your email"
             });
         }
         catch (emailError) {
@@ -430,7 +429,6 @@ async function sendEmailVerificationOTPOld(req, res) {
         });
         res.json({
             success: true,
-            otp: otp,
             message: "OTP sent successfully to your email"
         });
     }
@@ -467,7 +465,6 @@ async function sendEmailVerificationOTP(req, res) {
         console.log(`========================================\n`);
         res.json({
             success: true,
-            otp,
             message: "OTP sent successfully",
             profile_for: req.body.profile_for || null,
             phone,

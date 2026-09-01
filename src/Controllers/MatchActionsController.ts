@@ -1,4 +1,4 @@
-import * as utils from "util";
+﻿import * as utils from "util";
 import {
   createInterestAlert,
   createInterestAcceptedAlert,
@@ -40,7 +40,7 @@ function logConnectPerf(perf, label: string, start: number, extra = "") {
   console.log(`[CONNECT-PERF] ${connectPerfMeta(perf)} ${label}: ${connectPerfElapsed(start)}ms${suffix}`);
 }
 
-// Get parent filter clause for a user — returns SQL snippet
+// Get parent filter clause for a user â€” returns SQL snippet
 async function getParentFilter(userId: number): Promise<string> {
   const [profile] = await query(
     `SELECT profile_created_by FROM user_profiles WHERE user_id = ?`, [userId]
@@ -106,9 +106,13 @@ export async function sendInterest(req, res) {
       "INSERT INTO user_interests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'sent') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'sent', updated_at = CURRENT_TIMESTAMP",
       [userId, target_user_id, message]
     );
+    const [interestRow] = await query(
+      "SELECT id FROM user_interests WHERE sender_id = ? AND receiver_id = ? LIMIT 1",
+      [userId, target_user_id]
+    );
 
     // Create alert for receiver
-    await createInterestAlert(target_user_id, userId);
+    await createInterestAlert(target_user_id, userId, interestRow?.id);
 
     res.json({ success: true, message: "Interest sent successfully" });
   } catch (error) {
@@ -135,7 +139,7 @@ export async function acceptInterest(req, res) {
     const [interest] = await query(
       "SELECT sender_id FROM user_interests WHERE id = ?", [interest_id]
     );
-    if (interest) await createInterestAcceptedAlert(interest.sender_id, userId);
+    if (interest) await createInterestAcceptedAlert(interest.sender_id, userId, interest_id);
 
     res.json({ success: true, message: "Interest accepted successfully" });
   } catch (error) {
@@ -159,7 +163,7 @@ export async function declineInterest(req, res) {
     const [interest] = await query(
       "SELECT sender_id FROM user_interests WHERE id = ?", [interest_id]
     );
-    if (interest) await createInterestDeclinedAlert(interest.sender_id, userId);
+    if (interest) await createInterestDeclinedAlert(interest.sender_id, userId, interest_id);
 
     res.json({ success: true, message: "Interest declined successfully" });
   } catch (error) {
@@ -208,7 +212,7 @@ export async function unblockUser(req, res) {
       return res.status(400).json({ success: false, message: "User is not blocked" });
     }
 
-    // Remove only the blocker's row (A→B)
+    // Remove only the blocker's row (Aâ†’B)
     await query(
       "DELETE FROM user_actions WHERE user_id = ? AND target_user_id = ? AND action_type_id = 3",
       [userId, targetId]
@@ -629,7 +633,7 @@ export async function getBlockedUsers(req, res) {
       WHERE user_id = ? AND action_type_id = 3
     `, [userId]);
 
-     // Do NOT apply privacy filter here — these are blocked users, we want to show their info
+     // Do NOT apply privacy filter here â€” these are blocked users, we want to show their info
     const validProfiles = enrichedProfiles.filter((p: any) => p !== null && p !== undefined);
     res.json({
       success: true,
@@ -663,16 +667,20 @@ export async function addToShortlist(req, res) {
       "INSERT INTO user_actions (user_id, target_user_id, action_type_id) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE created_at = CURRENT_TIMESTAMP",
       [userId, target_user_id]
     );
+    const [shortlistAction] = await query(
+      "SELECT id FROM user_actions WHERE user_id = ? AND target_user_id = ? AND action_type_id = 1 LIMIT 1",
+      [userId, target_user_id]
+    );
 
-    // Section 12 — only notify if shortlist_visibility = 'let_others_know' (default)
-    // 'do_not_let_others_know' → skip alert entirely
+    // Section 12 â€” only notify if shortlist_visibility = 'let_others_know' (default)
+    // 'do_not_let_others_know' â†’ skip alert entirely
     const [ps] = await query(
       `SELECT shortlist_visibility FROM privacy_settings WHERE user_id = ?`,
       [target_user_id]
     );
     const visibility = ps?.shortlist_visibility ?? 'let_others_know';
     if (visibility !== 'do_not_let_others_know') {
-      await createShortlistAlert(target_user_id, userId);
+      await createShortlistAlert(target_user_id, userId, shortlistAction?.id);
     }
 
     res.json({ success: true, message: "Added to shortlist successfully" });
@@ -700,7 +708,7 @@ export async function dontShowAgain(req, res) {
   }
 }
 
-// Block Profile (bidirectional — blocked user also cannot see blocker's profile)
+// Block Profile (bidirectional â€” blocked user also cannot see blocker's profile)
 export async function blockProfile(req, res) {
   try {
     const userId = req.user.user_id;
@@ -715,7 +723,7 @@ export async function blockProfile(req, res) {
       return res.status(400).json({ success: false, message: "User already blocked" });
     }
 
-    // Insert only one-directional block (A→B)
+    // Insert only one-directional block (Aâ†’B)
     // Visibility is bidirectional via OR condition in privacyFilter
     await query(
       "INSERT INTO user_actions (user_id, target_user_id, action_type_id) VALUES (?, ?, 3) ON DUPLICATE KEY UPDATE created_at = CURRENT_TIMESTAMP",
@@ -1461,12 +1469,17 @@ export async function connectNow(req, res) {
       "INSERT INTO connect_now_requests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'pending', updated_at = CURRENT_TIMESTAMP",
       [userId, target_user_id, message]
     );
-    if (perf && connectionResult?.insertId) perf.connectionId = connectionResult.insertId;
+    const [connectionRow] = await query(
+      "SELECT id FROM connect_now_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1",
+      [userId, target_user_id]
+    );
+    const connectionRequestId = connectionRow?.id || connectionResult?.insertId;
+    if (perf && connectionRequestId) perf.connectionId = connectionRequestId;
     logConnectPerf(perf, "create-connection-db-operation", createConnectionStart);
 
     // Create alert for receiver
     const notificationStart = perf ? connectPerfNow() : 0;
-    await createConnectNowAlert(target_user_id, userId, perf);
+    await createConnectNowAlert(target_user_id, userId, perf, connectionRequestId);
     logConnectPerf(perf, "create-notification-total", notificationStart);
 
     if (perf) {
@@ -1510,7 +1523,7 @@ export async function acceptConnectRequest(req, res) {
     const [req2] = await query(
       "SELECT sender_id FROM connect_now_requests WHERE id = ?", [request_id]
     );
-    if (req2) await createConnectAcceptedAlert(req2.sender_id, userId);
+    if (req2) await createConnectAcceptedAlert(req2.sender_id, userId, request_id);
 
     res.json({ success: true, message: "Connect request accepted successfully" });
   } catch (error) {
@@ -1545,7 +1558,7 @@ export async function declineConnectRequest(req, res) {
     const [req2] = await query(
       "SELECT sender_id FROM connect_now_requests WHERE id = ?", [request_id]
     );
-    if (req2) await createConnectDeclinedAlert(req2.sender_id, userId);
+    if (req2) await createConnectDeclinedAlert(req2.sender_id, userId, request_id);
 
     res.json({ success: true, message: "Connect request declined successfully" });
   } catch (error) {
@@ -1554,7 +1567,7 @@ export async function declineConnectRequest(req, res) {
   }
 }
 
-// Cancel Connect Request (by sender — A withdraws their own pending OR accepted request)
+// Cancel Connect Request (by sender â€” A withdraws their own pending OR accepted request)
 export async function cancelConnectRequest(req, res) {
   try {
     const userId = req.user.user_id;
@@ -1644,7 +1657,7 @@ export async function getInitialMatches(req, res) {
   try {
     const userId = req.user.user_id;
 
-    // Check subscription → limit 10 for subscribed, 3 for free.
+    // Check subscription â†’ limit 10 for subscribed, 3 for free.
     // isViewerPremium() also returns true for everyone while the admin subscription
     // restrictions switch is off, so free members get the full 10 in that mode.
     const hasSubscription = await isViewerPremium(userId);
@@ -1911,7 +1924,7 @@ export async function getInitialMatches(req, res) {
       };
     }));
 
-    // ── Apply privacy filter to all matches (DOB, income, photo, phone, email)
+    // â”€â”€ Apply privacy filter to all matches (DOB, income, photo, phone, email)
     const filteredMatches = await applyPrivacyFilterToMatches(
       enrichedMatches.filter(Boolean),
       userId
@@ -2293,9 +2306,13 @@ export async function connectWithSelected(req, res) {
           "INSERT INTO connect_now_requests (sender_id, receiver_id, message, status) VALUES (?, ?, ?, 'pending') ON DUPLICATE KEY UPDATE message = VALUES(message), status = 'pending', updated_at = CURRENT_TIMESTAMP",
           [userId, targetUserId, message]
         );
+        const [connectionRow] = await query(
+          "SELECT id FROM connect_now_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1",
+          [userId, targetUserId]
+        );
 
         // Create alert for each receiver
-        await createConnectNowAlert(targetUserId, userId);
+        await createConnectNowAlert(targetUserId, userId, null, connectionRow?.id);
 
         results.push({ user_id: targetUserId, status: 'sent' });
       } catch (error) {
@@ -2577,3 +2594,6 @@ export async function getAcceptedConnections(req, res) {
     res.status(500).json({ success: false, message: 'Server error' });
   }
 }
+
+
+

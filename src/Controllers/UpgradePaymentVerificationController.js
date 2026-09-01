@@ -8,6 +8,7 @@ const query = utils.promisify(db.query).bind(db);
 // ============ VERIFY UPGRADE PAYMENT ============
 const verifyUpgradePayment = async (req, res) => {
     var _a;
+    let connection = null;
     try {
         const vendorId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
         const { razorpay_order_id, razorpay_payment_id, razorpay_signature, payment_method } = req.body;
@@ -37,24 +38,79 @@ const verifyUpgradePayment = async (req, res) => {
         }
         const paymentType = paymentRecord[0].payment_type;
         const newPlanId = paymentRecord[0].plan_id;
-        // Update payment status
-        await query("UPDATE vendor_payments SET payment_status = 'success', gateway_payment_id = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?", [razorpay_payment_id, paymentRecord[0].id]);
-        // Update subscription with new plan_id
+        // Acquire dedicated connection for atomic post-capture transaction
+        connection = await new Promise((resolve, reject) => {
+            db.getConnection((err, conn) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve(conn);
+            });
+        });
+        const queryConn = (sql, params = []) => {
+            return new Promise((resolve, reject) => {
+                connection.query(sql, params, (err, results) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(results);
+                });
+            });
+        };
+        await new Promise((resolve, reject) => {
+            connection.beginTransaction((err) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve();
+            });
+        });
         const newEndDate = new Date();
         newEndDate.setMonth(newEndDate.getMonth() + 1);
-        // For both upgrade and renewal, update the subscription
-        await query("UPDATE vendor_subscriptions SET plan_id = ?, subscription_end_date = ?, status = 'active', next_billing_date = ? WHERE vendor_id = ? AND status = 'active'", [newPlanId, newEndDate.toISOString().split('T')[0], newEndDate.toISOString().split('T')[0], vendorId]);
-        // Log payment type for debugging
-        console.log(`Payment verified: type=${paymentType}, vendor_id=${vendorId}, plan_id=${newPlanId}`);
-        res.json({
-            success: true,
-            message: "Payment verified successfully",
-            data: { payment_id: razorpay_payment_id }
-        });
+        try {
+            // 1. Update payment status
+            await queryConn("UPDATE vendor_payments SET payment_status = 'success', gateway_payment_id = ?, paid_at = CURRENT_TIMESTAMP WHERE id = ?", [razorpay_payment_id, paymentRecord[0].id]);
+            // 2. Update subscription with new plan_id
+            await queryConn("UPDATE vendor_subscriptions SET plan_id = ?, subscription_end_date = ?, status = 'active', next_billing_date = ? WHERE vendor_id = ? AND status = 'active'", [newPlanId, newEndDate.toISOString().split('T')[0], newEndDate.toISOString().split('T')[0], vendorId]);
+            // 3. Commit transaction
+            await new Promise((resolve, reject) => {
+                connection.commit((err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve();
+                });
+            });
+            // Log payment type for debugging
+            console.log(`Payment verified: type=${paymentType}, vendor_id=${vendorId}, plan_id=${newPlanId}`);
+            res.json({
+                success: true,
+                message: "Payment verified successfully",
+                data: { payment_id: razorpay_payment_id }
+            });
+        }
+        catch (txnError) {
+            await new Promise((resolve) => {
+                connection.rollback(() => resolve());
+            });
+            console.error(`[CRITICAL PAYMENT RECONCILIATION NEEDED] Vendor upgrade payment was captured at gateway (PaymentID: ${razorpay_payment_id}, OrderID: ${razorpay_order_id}, Vendor: ${vendorId}, Plan: ${newPlanId}), but DB transaction failed and was rolled back!`, txnError);
+            res.status(500).json({
+                success: false,
+                message: `Payment was captured by gateway, but subscription update failed. Please contact support with payment ID: ${razorpay_payment_id}`,
+                reconciliation_required: true,
+                payment_id: razorpay_payment_id,
+                order_id: razorpay_order_id
+            });
+        }
     }
     catch (error) {
         console.error("Error verifying payment:", error);
         res.status(500).json({ success: false, message: "Internal server error" });
+    }
+    finally {
+        if (connection) {
+            connection.release();
+        }
     }
 };
 exports.verifyUpgradePayment = verifyUpgradePayment;

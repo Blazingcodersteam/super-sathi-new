@@ -1,8 +1,7 @@
-import * as utils from "util";
+﻿import * as utils from "util";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import * as path from "path";
-import { sendMail } from "./SendMailController";
-import { EmailService } from "./EmailService";
+import { enqueueEmailOutboxJob } from "../services/emailOutboxService";
 
 const db = require("../database");
 const query = utils.promisify(db.query).bind(db);
@@ -75,19 +74,26 @@ export async function submitSuccessStory(req, res) {
       story_content, photoUrl, agree_to_terms ? 1 : 0, feature_in_stories ? 1 : 0
     ]);
 
-    // Send confirmation email
+    // Queue confirmation email
     try {
-      await EmailService.sendTemplateEmail(
-        'success_story',
-        user_email,
-        { user_name, partner_name },
-        {
+      await enqueueEmailOutboxJob({
+        jobType: "alert-email",
+        eventKey: "success_story",
+        deduplicationKey: `success-story-email:${result.insertId}`,
+        payload: {
+          kind: "alert-email",
+          toEmail: user_email,
+          recipientName: user_name,
+          templateKey: "success_story",
+          variables: { user_name, partner_name },
           fallbackSubject: 'Thank You for Sharing Your Success Story - Vivaaha Matrimony',
-          fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px"><h1 style="color:#d4af37">🎉 Thank You!</h1><p>Dear ${user_name},</p><p>We are delighted to receive your beautiful success story with ${partner_name}!</p><p>Our team will review your story within 2-3 business days. Once approved, it will be featured on our Success Stories page.</p><p>With warm regards,<br><strong>The Vivaaha Matrimony Team</strong></p></div>`,
-        }
-      );
-    } catch (emailError) {
-      console.error("Email sending failed:", emailError);
+          fallbackBody: `Dear ${user_name}, we are delighted to receive your success story with ${partner_name}. Our team will review your story within 2-3 business days.`,
+          fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:20px"><h1 style="color:#d4af37">Thank You!</h1><p>Dear ${user_name},</p><p>We are delighted to receive your beautiful success story with ${partner_name}!</p><p>Our team will review your story within 2-3 business days. Once approved, it will be featured on our Success Stories page.</p><p>With warm regards,<br><strong>The Vivaaha Matrimony Team</strong></p></div>`,
+          meta: { event: "success_story", connectionId: result.insertId },
+        },
+      });
+    } catch (emailError: any) {
+      console.error("Email outbox queueing failed:", { storyId: result.insertId, message: emailError?.message });
     }
 
     res.json({
@@ -209,3 +215,4 @@ export async function updateSuccessStoryStatus(req, res) {
     res.status(500).json({ success: false, message: "Server error" });
   }
 }
+

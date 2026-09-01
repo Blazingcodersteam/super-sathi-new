@@ -233,8 +233,7 @@ export async function sendEmailUpdateOTP(req, res) {
       res.json({
         success: true,
         message: "OTP sent successfully to your current email",
-        current_email: user.email,
-        otp: otp
+        current_email: user.email
       });
     } catch (emailError) {
       console.error("Email sending failed:", emailError);

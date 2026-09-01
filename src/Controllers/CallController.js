@@ -1,5 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.autoExpireMissedCalls = autoExpireMissedCalls;
+exports.startCallExpirationWorker = startCallExpirationWorker;
+exports.stopCallExpirationWorker = stopCallExpirationWorker;
 exports.createCall = createCall;
 exports.acceptCall = acceptCall;
 exports.declineCall = declineCall;
@@ -11,7 +14,7 @@ exports.getCallHistoryWithUser = getCallHistoryWithUser;
 exports.getIncomingCalls = getIncomingCalls;
 const utils = require("util");
 const agora_token_1 = require("agora-token");
-const EmailService_1 = require("./EmailService");
+const emailOutboxService_1 = require("../services/emailOutboxService");
 const SocketManager_1 = require("../socket/SocketManager");
 const fcm_1 = require("../utils/fcm");
 const AlertsController_1 = require("./AlertsController");
@@ -20,7 +23,10 @@ const query = utils.promisify(db.query).bind(db);
 const AGORA_APP_ID = process.env.AGORA_APP_ID || 'aa2478188cc6474b95078488cfe7db79';
 const AGORA_APP_CERTIFICATE = process.env.AGORA_APP_CERTIFICATE || '5acc66fdc26044a18e6df737a7a41259';
 const TOKEN_EXPIRATION_TIME = 3600;
-const CALL_RING_TIMEOUT_SECONDS = 45;
+const CALL_RING_TIMEOUT_SECONDS = parseInt(process.env.CALL_RING_TIMEOUT_SECONDS || '45', 10);
+const CALL_EXPIRATION_INTERVAL_MS = parseInt(process.env.CALL_EXPIRATION_INTERVAL_MS || '10000', 10);
+let expirationTimer = null;
+let isWorkerRunning = false;
 var CallStatus;
 (function (CallStatus) {
     CallStatus["INITIATED"] = "initiated";
@@ -40,7 +46,7 @@ const ALERT_CALL_MISSED = 10;
 function generateAgoraToken(channelName, uid) {
     const currentTimestamp = Math.floor(Date.now() / 1000);
     const privilegeExpiredTs = currentTimestamp + TOKEN_EXPIRATION_TIME;
-    return agora_token_1.RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, uid, agora_token_1.RtcRole.PUBLISHER, // FIX: PUBLISHER so users can send audio/video streams
+    return agora_token_1.RtcTokenBuilder.buildTokenWithUid(AGORA_APP_ID, AGORA_APP_CERTIFICATE, channelName, uid, agora_token_1.RtcRole.PUBLISHER, // PUBLISHER so users can send audio/video streams
     privilegeExpiredTs, privilegeExpiredTs);
 }
 async function validateCallPermission(callerId, receiverId) {
@@ -60,29 +66,106 @@ async function validateCallPermission(callerId, receiverId) {
 // Auto-expire calls that have been RINGING (not yet accepted) for more than CALL_RING_TIMEOUT_SECONDS
 async function autoExpireMissedCalls() {
     try {
-        // Only expire calls still in initiated/ringing — never touch accepted calls
-        const expiredCalls = await query(`
-      SELECT id, caller_id, receiver_id FROM call_sessions
+        // Only fetch calls that are in initiated or ringing status and past the timeout
+        const staleCalls = await query(`
+      SELECT id, caller_id, receiver_id, call_type, channel_name
+      FROM call_sessions
       WHERE status IN (?, ?)
-      AND accepted_at IS NULL
-      AND TIMESTAMPDIFF(SECOND, created_at, NOW()) > ?
+        AND accepted_at IS NULL
+        AND TIMESTAMPDIFF(SECOND, created_at, NOW()) >= ?
+      LIMIT 100
     `, [CallStatus.INITIATED, CallStatus.RINGING, CALL_RING_TIMEOUT_SECONDS]);
-        if (expiredCalls.length > 0) {
-            const expiredIds = expiredCalls.map((c) => c.id);
-            await query(`
+        if (!staleCalls || staleCalls.length === 0) {
+            return 0;
+        }
+        let expiredCount = 0;
+        for (const call of staleCalls) {
+            // Atomic conditional update per call guarantees race safety against concurrent accept/decline/end
+            const result = await query(`
         UPDATE call_sessions
-        SET status = ?, updated_at = NOW()
-        WHERE id IN (?) AND status IN (?, ?) AND accepted_at IS NULL
-      `, [CallStatus.MISSED, expiredIds, CallStatus.INITIATED, CallStatus.RINGING]);
-            // Create missed call alerts
-            for (const call of expiredCalls) {
-                await (0, AlertsController_1.createCallAlert)(call.receiver_id, ALERT_CALL_MISSED, call.caller_id, 'Missed Call', 'You missed a call');
-                await (0, AlertsController_1.createCallAlert)(call.caller_id, ALERT_CALL_MISSED, call.receiver_id, 'Call Not Answered', 'Your call was not answered');
+        SET status = ?, updated_at = NOW(), duration_seconds = 0
+        WHERE id = ?
+          AND status IN (?, ?)
+          AND accepted_at IS NULL
+      `, [CallStatus.MISSED, call.id, CallStatus.INITIATED, CallStatus.RINGING]);
+            if (result && result.affectedRows > 0) {
+                expiredCount++;
+                // Create missed call alerts (receiver gets 'Missed Call', caller gets 'Call Not Answered')
+                try {
+                    await (0, AlertsController_1.createCallAlert)(call.receiver_id, ALERT_CALL_MISSED, call.caller_id, 'Missed Call', `You missed a ${call.call_type || 'voice'} call`, {}, { call_type: call.call_type, call_id: call.id });
+                    await (0, AlertsController_1.createCallAlert)(call.caller_id, ALERT_CALL_MISSED, call.receiver_id, 'Call Not Answered', `Your ${call.call_type || 'voice'} call was not answered`, {}, { call_type: call.call_type, call_id: call.id });
+                }
+                catch (alertErr) {
+                    console.error(`[CallExpiration] Failed to create call alert for call ${call.id}:`, alertErr);
+                }
+                // Notify both parties via Socket.IO to terminate ringing UI on active devices
+                try {
+                    const io = (0, SocketManager_1.getIO)();
+                    if (io) {
+                        const expirePayload = {
+                            call_id: call.id,
+                            status: CallStatus.MISSED,
+                            reason: 'timeout',
+                            channel_name: call.channel_name,
+                        };
+                        io.to(`user_${call.caller_id}`).emit('call_missed', expirePayload);
+                        io.to(`user_${call.receiver_id}`).emit('call_missed', expirePayload);
+                        io.to(`user_${call.caller_id}`).emit('call_ended', Object.assign(Object.assign({}, expirePayload), { ended_by: 'system' }));
+                        io.to(`user_${call.receiver_id}`).emit('call_ended', Object.assign(Object.assign({}, expirePayload), { ended_by: 'system' }));
+                    }
+                }
+                catch (socketErr) {
+                    // Socket may not be available or user offline
+                }
             }
         }
+        if (expiredCount > 0) {
+            console.log(`[CallExpiration] Auto-expired ${expiredCount} stale ringing call(s)`);
+        }
+        return expiredCount;
     }
     catch (error) {
-        console.error('Auto expire missed calls error:', error);
+        console.error('[CallExpiration] Auto expire missed calls error:', error);
+        return 0;
+    }
+}
+// Start single controlled background worker interval
+function startCallExpirationWorker(intervalMs = CALL_EXPIRATION_INTERVAL_MS) {
+    if (expirationTimer) {
+        return; // Already running (singleton guard)
+    }
+    console.log(`[CallExpiration] Starting call auto-expiration worker (interval: ${intervalMs}ms, timeout: ${CALL_RING_TIMEOUT_SECONDS}s)`);
+    // Run initial pass immediately on startup
+    autoExpireMissedCalls().catch((err) => {
+        console.error('[CallExpiration] Initial pass error:', err);
+    });
+    expirationTimer = setInterval(async () => {
+        if (isWorkerRunning) {
+            return; // Skip tick if previous tick is still executing
+        }
+        isWorkerRunning = true;
+        try {
+            await autoExpireMissedCalls();
+        }
+        catch (err) {
+            console.error('[CallExpiration] Periodic check error:', err);
+        }
+        finally {
+            isWorkerRunning = false;
+        }
+    }, intervalMs);
+    // Allow Node process to exit without waiting on unref if appropriate
+    if (expirationTimer && typeof expirationTimer.unref === 'function') {
+        expirationTimer.unref();
+    }
+}
+// Graceful shutdown helper to stop the worker interval
+function stopCallExpirationWorker() {
+    if (expirationTimer) {
+        clearInterval(expirationTimer);
+        expirationTimer = null;
+        isWorkerRunning = false;
+        console.log('[CallExpiration] Call auto-expiration worker stopped');
     }
 }
 // Create Call Session
@@ -201,18 +284,37 @@ async function createCall(req, res) {
         // Insert notification into user_alerts
         await (0, AlertsController_1.createCallAlert)(receiver_id, ALERT_INCOMING_CALL, userId, 'Incoming Call', `You have an incoming ${call_type} call`, {}, { call_type, call_id: callId });
         try {
-            await EmailService_1.EmailService.sendTemplateEmail('incoming_call', receiver.email, {
-                user_name: `${receiver.first_name} ${receiver.last_name}`,
-                caller_name: `${caller.first_name} ${caller.last_name}`,
-                call_type,
-                call_id: callId,
-            }, {
-                fallbackSubject: `Incoming ${call_type.charAt(0).toUpperCase() + call_type.slice(1)} Call - Vivaaha Matrimony`,
-                fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h2>📞 Incoming ${call_type} Call</h2><p>You have an incoming ${call_type} call from <strong>${caller.first_name} ${caller.last_name}</strong>.</p><p>Please open your Vivaaha app to accept or decline the call.</p><p>Best regards,<br>Vivaaha Matrimony Team</p></div>`,
+            const emailJob = await (0, emailOutboxService_1.enqueueEmailOutboxJob)({
+                jobType: "alert-email",
+                eventKey: "incoming_call",
+                deduplicationKey: `incoming-call-email:${callId}`,
+                payload: {
+                    kind: "alert-email",
+                    userId: receiver_id,
+                    templateKey: "incoming_call",
+                    variables: {
+                        user_name: `${receiver.first_name} ${receiver.last_name}`,
+                        caller_name: `${caller.first_name} ${caller.last_name}`,
+                        call_type,
+                        call_id: callId,
+                    },
+                    fallbackSubject: `Incoming ${call_type.charAt(0).toUpperCase() + call_type.slice(1)} Call - Vivaaha Matrimony`,
+                    fallbackBody: `You have an incoming ${call_type} call from ${caller.first_name} ${caller.last_name}. Please open your Vivaaha app to accept or decline the call.`,
+                    fallbackHtml: `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto"><h2>Incoming ${call_type} Call</h2><p>You have an incoming ${call_type} call from <strong>${caller.first_name} ${caller.last_name}</strong>.</p><p>Please open your Vivaaha app to accept or decline the call.</p><p>Best regards,<br>Vivaaha Matrimony Team</p></div>`,
+                    meta: {
+                        event: "incoming_call",
+                        senderUserId: userId,
+                        receiverUserId: receiver_id,
+                        connectionId: callId,
+                    },
+                },
             });
+            if (emailJob.duplicate) {
+                console.log(`[EMAIL-OUTBOX] duplicate email job event=incoming_call job=${emailJob.id}`);
+            }
         }
         catch (emailError) {
-            console.error('Failed to send call notification email:', emailError);
+            console.error('Failed to queue call notification email:', { callId, message: emailError === null || emailError === void 0 ? void 0 : emailError.message });
         }
         await query(`
       UPDATE call_sessions SET status = ?, updated_at = NOW() WHERE id = ?
@@ -235,7 +337,9 @@ async function createCall(req, res) {
         // Emit incoming_call via socket (works when app is open)
         try {
             const io = (0, SocketManager_1.getIO)();
-            io.to(`user_${receiver_id}`).emit('incoming_call', callPayload);
+            if (io) {
+                io.to(`user_${receiver_id}`).emit('incoming_call', callPayload);
+            }
         }
         catch (_) { }
         // Send FCM push notification (works when app is background/killed)
@@ -345,30 +449,35 @@ async function acceptCall(req, res) {
                     }
                 });
             }
-            // Check if call was cancelled/missed by caller
+            // Check if call was cancelled/missed by caller or expired
             const [cancelledCall] = await query(`
         SELECT status FROM call_sessions WHERE id = ? AND receiver_id = ?
       `, [call_id, userId]);
             if (cancelledCall && (cancelledCall.status === CallStatus.MISSED || cancelledCall.status === CallStatus.ENDED)) {
-                return res.status(410).json({ success: false, message: 'Call was cancelled by the caller' });
+                return res.status(410).json({ success: false, message: 'Call was cancelled by the caller or expired' });
             }
             return res.status(404).json({ success: false, message: 'Call not found or cannot be accepted' });
         }
-        // CRITICAL FIX: Update status to ACCEPTED immediately to prevent getIncomingCalls from returning it
-        await query(`
+        // Atomic update status to ACCEPTED: checks status IN ('initiated', 'ringing') to prevent race condition
+        const updateResult = await query(`
       UPDATE call_sessions SET status = ?, accepted_at = NOW(), updated_at = NOW() WHERE id = ? AND status IN (?, ?)
     `, [CallStatus.ACCEPTED, call_id, CallStatus.INITIATED, CallStatus.RINGING]);
+        if (!updateResult || updateResult.affectedRows === 0) {
+            return res.status(410).json({ success: false, message: 'Call has already ended or expired' });
+        }
         // Insert notification into user_alerts
         await (0, AlertsController_1.createCallAlert)(call.caller_id, ALERT_CALL_ACCEPTED, userId, 'Call Accepted', 'Your call has been accepted', {}, null);
         // Notify caller via socket that call was accepted
         try {
             const io = (0, SocketManager_1.getIO)();
-            io.to(`user_${call.caller_id}`).emit('call_accepted', {
-                call_id: call_id,
-                receiver_id: userId,
-                channel_name: call.channel_name,
-                call_type: call.call_type,
-            });
+            if (io) {
+                io.to(`user_${call.caller_id}`).emit('call_accepted', {
+                    call_id: call_id,
+                    receiver_id: userId,
+                    channel_name: call.channel_name,
+                    call_type: call.call_type,
+                });
+            }
         }
         catch (_) { }
         res.json({
@@ -408,20 +517,25 @@ async function declineCall(req, res) {
         if (!call) {
             return res.status(404).json({ success: false, message: 'Call not found or cannot be declined' });
         }
-        await query(`
+        const updateResult = await query(`
       UPDATE call_sessions
       SET status = ?, declined_at = NOW(), decline_reason = ?, updated_at = NOW()
-      WHERE id = ?
-    `, [CallStatus.DECLINED, reason || 'User declined', call_id]);
+      WHERE id = ? AND status IN (?, ?)
+    `, [CallStatus.DECLINED, reason || 'User declined', call_id, CallStatus.INITIATED, CallStatus.RINGING]);
+        if (!updateResult || updateResult.affectedRows === 0) {
+            return res.status(410).json({ success: false, message: 'Call has already ended or expired' });
+        }
         // Insert notification into user_alerts
         await (0, AlertsController_1.createCallAlert)(call.caller_id, ALERT_CALL_DECLINED, userId, 'Call Declined', 'Your call was declined', {}, null);
         // Notify caller via socket that call was declined
         try {
             const io = (0, SocketManager_1.getIO)();
-            io.to(`user_${call.caller_id}`).emit('call_declined', {
-                call_id: call_id,
-                receiver_id: userId,
-            });
+            if (io) {
+                io.to(`user_${call.caller_id}`).emit('call_declined', {
+                    call_id: call_id,
+                    receiver_id: userId,
+                });
+            }
         }
         catch (_) { }
         res.json({ success: true, message: 'Call declined successfully' });
@@ -439,7 +553,7 @@ async function endCall(req, res) {
         if (!call_id) {
             return res.status(400).json({ success: false, message: 'call_id is required' });
         }
-        // FIX: Allow ending calls in any active status (accepted, ringing, initiated)
+        // Allow ending calls in any active status (accepted, ringing, initiated)
         const [call] = await query(`
       SELECT * FROM call_sessions
       WHERE id = ? AND (caller_id = ? OR receiver_id = ?)
@@ -449,22 +563,21 @@ async function endCall(req, res) {
             return res.status(404).json({ success: false, message: 'Call not found or already ended' });
         }
         // Calculate duration using server time for consistency across devices
-        // Use TIMESTAMPDIFF in the update query itself to avoid timezone issues
         const finalStatus = call.status === CallStatus.ACCEPTED ? CallStatus.ENDED : CallStatus.MISSED;
         if (call.accepted_at) {
             // Use MySQL TIMESTAMPDIFF for accurate, consistent duration across devices
             await query(`
         UPDATE call_sessions
         SET status = ?, ended_at = NOW(), duration_seconds = TIMESTAMPDIFF(SECOND, accepted_at, NOW()), updated_at = NOW()
-        WHERE id = ?
-      `, [finalStatus, call_id]);
+        WHERE id = ? AND status IN (?, ?, ?)
+      `, [finalStatus, call_id, CallStatus.ACCEPTED, CallStatus.RINGING, CallStatus.INITIATED]);
         }
         else {
             await query(`
         UPDATE call_sessions
         SET status = ?, ended_at = NOW(), duration_seconds = 0, updated_at = NOW()
-        WHERE id = ?
-      `, [finalStatus, call_id]);
+        WHERE id = ? AND status IN (?, ?, ?)
+      `, [finalStatus, call_id, CallStatus.ACCEPTED, CallStatus.RINGING, CallStatus.INITIATED]);
         }
         // Fetch the actual stored duration for the response
         const [updatedCall] = await query(`SELECT duration_seconds FROM call_sessions WHERE id = ?`, [call_id]);
@@ -475,11 +588,13 @@ async function endCall(req, res) {
         // Notify other party via socket that call ended
         try {
             const io = (0, SocketManager_1.getIO)();
-            io.to(`user_${otherUserId}`).emit('call_ended', {
-                call_id: call_id,
-                ended_by: userId,
-                duration_seconds: callDuration,
-            });
+            if (io) {
+                io.to(`user_${otherUserId}`).emit('call_ended', {
+                    call_id: call_id,
+                    ended_by: userId,
+                    duration_seconds: callDuration,
+                });
+            }
         }
         catch (_) { }
         res.json({
@@ -669,9 +784,9 @@ async function getCallHistoryWithUser(req, res) {
 async function getIncomingCalls(req, res) {
     try {
         const userId = req.user.user_id;
-        // FIX: Auto-expire missed calls before fetching
+        // Auto-expire missed calls before fetching
         await autoExpireMissedCalls();
-        // CRITICAL FIX: Only return calls that are truly pending (not accepted, declined, ended, or missed)
+        // Only return calls that are truly pending (not accepted, declined, ended, or missed)
         const incomingCalls = await query(`
       SELECT cs.*,
              caller_profile.first_name as caller_first_name,

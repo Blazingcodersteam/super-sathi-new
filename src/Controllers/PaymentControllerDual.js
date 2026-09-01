@@ -443,6 +443,7 @@ async function createCCAvenueOrder(userId, planId, plan, gstCalculation, selecte
 }
 // CCAvenue Callback Handler
 async function handleCCAvenueCallback(req, res) {
+    let connection = null;
     try {
         console.log('CCAvenue Callback received');
         console.log('Request body:', req.body);
@@ -473,83 +474,168 @@ async function handleCCAvenueCallback(req, res) {
             });
         }
         if (orderStatus === 'Success') {
-            // Log successful payment
-            await query(`
-        INSERT INTO payment_logs (user_id, order_id, payment_id, amount, method, status, payment_gateway, gateway_response)
-        VALUES (?, ?, ?, ?, ?, 'captured', 'ccavenue', ?)
-      `, [paymentOrder.user_id, orderId, trackingId, amount, decryptedData.payment_mode, JSON.stringify(decryptedData)]);
-            // Update payment order
-            await query(`
-        UPDATE payment_orders SET status = 'paid', ccavenue_tracking_id = ?, updated_at = CURRENT_TIMESTAMP 
-        WHERE ccavenue_order_id = ?
-      `, [trackingId, orderId]);
-            // Create payment record with GST details
-            const paymentResult = await query(`
-        INSERT INTO payments (user_id, plan_id, order_id, payment_id, ccavenue_tracking_id, ccavenue_bank_ref_no, amount, base_amount, cgst_amount, sgst_amount, igst_amount, gst_type, total_gst_amount, currency_id, payment_method, payment_status_id, payment_gateway, payment_date, gateway_response)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 'ccavenue', CURRENT_TIMESTAMP, ?)
-      `, [paymentOrder.user_id, paymentOrder.plan_id, orderId, trackingId, trackingId, bankRefNo, amount, paymentOrder.base_amount, paymentOrder.cgst_amount, paymentOrder.sgst_amount, paymentOrder.igst_amount, paymentOrder.gst_type, paymentOrder.total_gst_amount, decryptedData.payment_mode, JSON.stringify(decryptedData)]);
-            // Generate invoice
-            const invoiceNumber = `INV-${new Date().getFullYear()}-${String(paymentResult.insertId).padStart(6, '0')}`;
-            const invoiceUrl = `${process.env.FRONTEND_URL || 'https://vivaaha.net'}/api/payments/invoice-view/${invoiceNumber}`;
-            // Get payment data for PDF
-            const [paymentData] = await query(`
-        SELECT p.*, sp.plan_name, sp.duration_months,
-               up.first_name, up.last_name, u.email, u.phone
-        FROM payments p
-        LEFT JOIN subscription_plans sp ON p.plan_id = sp.id
-        LEFT JOIN users u ON p.user_id = u.id
-        LEFT JOIN user_profiles up ON p.user_id = up.user_id
-        WHERE p.id = ?
-      `, [paymentResult.insertId]);
-            paymentData.invoice_number = invoiceNumber;
-            const pdfUrl = await generateInvoicePDF(paymentData);
-            // Update payment with invoice
-            await query(`
-        UPDATE payments SET invoice_number = ?, invoice_url = ?, invoice_pdf_url = ? WHERE id = ?
-      `, [invoiceNumber, invoiceUrl, pdfUrl, paymentResult.insertId]);
-            // Create subscription
-            const [plan] = await query(`SELECT * FROM subscription_plans WHERE id = ?`, [paymentOrder.plan_id]);
-            if (plan) {
-                const startDate = new Date();
-                const endDate = new Date();
-                endDate.setMonth(endDate.getMonth() + plan.duration_months);
-                const subscriptionResult = await query(`
-          INSERT INTO user_subscriptions (user_id, plan_id, payment_id, payment_order_id, start_date, end_date, activated_at, subscription_status_id, payment_status_id)
-          VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, 1)
-        `, [paymentOrder.user_id, paymentOrder.plan_id, paymentResult.insertId, orderId, startDate, endDate]);
-                await query(`
-          INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, payment_id, notes)
-          VALUES (?, ?, ?, 'activated', 'active', ?, 'Subscription activated via CCAvenue')
-        `, [paymentOrder.user_id, subscriptionResult.insertId, paymentOrder.plan_id, trackingId]);
-                // Process addons and plan change
-                if (paymentOrder.notes) {
-                    try {
-                        const orderNotes = JSON.parse(paymentOrder.notes);
-                        // If plan change, cancel old subscription now (after payment success)
-                        if (orderNotes.type === 'plan_change' && orderNotes.old_subscription_id) {
-                            await query(`
-                UPDATE user_subscriptions 
-                SET is_active = 0, subscription_status_id = 3, updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND user_id = ?
-              `, [orderNotes.old_subscription_id, paymentOrder.user_id]);
-                            await query(`
-                INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, old_status, new_status, notes)
-                VALUES (?, ?, ?, 'cancelled', 'active', 'cancelled', 'Cancelled after successful plan change payment via CCAvenue')
-              `, [paymentOrder.user_id, orderNotes.old_subscription_id, paymentOrder.plan_id]);
-                        }
-                        if (orderNotes.addons && orderNotes.addons.length > 0) {
-                            for (const addon of orderNotes.addons) {
-                                await query(`
-                  INSERT INTO user_subscription_addons (user_id, subscription_id, addon_id, quantity, amount_paid)
-                  VALUES (?, ?, ?, 1, ?)
-                `, [paymentOrder.user_id, subscriptionResult.insertId, addon.id, addon.price]);
+            // Acquire dedicated connection for atomic post-capture transaction
+            connection = await new Promise((resolve, reject) => {
+                db.getConnection((err, conn) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(conn);
+                });
+            });
+            const queryConn = (sql, params = []) => {
+                return new Promise((resolve, reject) => {
+                    connection.query(sql, params, (err, results) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve(results);
+                    });
+                });
+            };
+            await new Promise((resolve, reject) => {
+                connection.beginTransaction((err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        resolve();
+                });
+            });
+            let paymentInsertId;
+            let invoiceNumber = '';
+            let invoiceUrl = '';
+            try {
+                // 1. Log successful payment
+                await queryConn(`
+          INSERT INTO payment_logs (user_id, order_id, payment_id, amount, method, status, payment_gateway, gateway_response)
+          VALUES (?, ?, ?, ?, ?, 'captured', 'ccavenue', ?)
+        `, [paymentOrder.user_id, orderId, trackingId, amount, decryptedData.payment_mode, JSON.stringify(decryptedData)]);
+                // 2. Update payment order
+                await queryConn(`
+          UPDATE payment_orders SET status = 'paid', ccavenue_tracking_id = ?, updated_at = CURRENT_TIMESTAMP 
+          WHERE ccavenue_order_id = ?
+        `, [trackingId, orderId]);
+                // 3. Create payment record with GST details
+                const paymentResult = await queryConn(`
+          INSERT INTO payments (user_id, plan_id, order_id, payment_id, ccavenue_tracking_id, ccavenue_bank_ref_no, amount, base_amount, cgst_amount, sgst_amount, igst_amount, gst_type, total_gst_amount, currency_id, payment_method, payment_status_id, payment_gateway, payment_date, gateway_response)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 1, 'ccavenue', CURRENT_TIMESTAMP, ?)
+        `, [paymentOrder.user_id, paymentOrder.plan_id, orderId, trackingId, trackingId, bankRefNo, amount, paymentOrder.base_amount, paymentOrder.cgst_amount, paymentOrder.sgst_amount, paymentOrder.igst_amount, paymentOrder.gst_type, paymentOrder.total_gst_amount, decryptedData.payment_mode, JSON.stringify(decryptedData)]);
+                paymentInsertId = paymentResult.insertId;
+                // 4. Generate invoice number and update payment record
+                invoiceNumber = `INV-${new Date().getFullYear()}-${String(paymentInsertId).padStart(6, '0')}`;
+                invoiceUrl = `${process.env.FRONTEND_URL || 'https://vivaaha.net'}/api/payments/invoice-view/${invoiceNumber}`;
+                await queryConn(`
+          UPDATE payments SET invoice_number = ?, invoice_url = ? WHERE id = ?
+        `, [invoiceNumber, invoiceUrl, paymentInsertId]);
+                // 5. Get plan details and create subscription
+                const [plan] = await queryConn(`SELECT * FROM subscription_plans WHERE id = ?`, [paymentOrder.plan_id]);
+                if (plan) {
+                    const startDate = new Date();
+                    const endDate = new Date();
+                    endDate.setMonth(endDate.getMonth() + plan.duration_months);
+                    const subscriptionResult = await queryConn(`
+            INSERT INTO user_subscriptions (user_id, plan_id, payment_id, payment_order_id, start_date, end_date, activated_at, subscription_status_id, payment_status_id, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 1, 1, 1)
+          `, [paymentOrder.user_id, paymentOrder.plan_id, paymentInsertId, orderId, startDate, endDate]);
+                    await queryConn(`
+            INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, new_status, payment_id, notes)
+            VALUES (?, ?, ?, 'activated', 'active', ?, 'Subscription activated via CCAvenue')
+          `, [paymentOrder.user_id, subscriptionResult.insertId, paymentOrder.plan_id, trackingId]);
+                    // 6. Process addons and plan change
+                    if (paymentOrder.notes) {
+                        try {
+                            const orderNotes = JSON.parse(paymentOrder.notes);
+                            // If plan change, cancel old subscription now
+                            if (orderNotes.type === 'plan_change' && orderNotes.old_subscription_id) {
+                                await queryConn(`
+                  UPDATE user_subscriptions 
+                  SET is_active = 0, subscription_status_id = 3, updated_at = CURRENT_TIMESTAMP 
+                  WHERE id = ? AND user_id = ?
+                `, [orderNotes.old_subscription_id, paymentOrder.user_id]);
+                                await queryConn(`
+                  INSERT INTO subscription_logs (user_id, subscription_id, plan_id, action, old_status, new_status, notes)
+                  VALUES (?, ?, ?, 'cancelled', 'active', 'cancelled', 'Cancelled after successful plan change payment via CCAvenue')
+                `, [paymentOrder.user_id, orderNotes.old_subscription_id, paymentOrder.plan_id]);
+                            }
+                            if (orderNotes.addons && orderNotes.addons.length > 0) {
+                                for (const addon of orderNotes.addons) {
+                                    await queryConn(`
+                    INSERT INTO user_subscription_addons (user_id, subscription_id, addon_id, quantity, amount_paid)
+                    VALUES (?, ?, ?, 1, ?)
+                  `, [paymentOrder.user_id, subscriptionResult.insertId, addon.id, addon.price]);
+                                }
                             }
                         }
-                    }
-                    catch (e) {
-                        console.log('No addons to process');
+                        catch (e) {
+                            console.log('No addons to process or JSON parse error:', e);
+                        }
                     }
                 }
+                // 7. COMMIT TRANSACTION
+                await new Promise((resolve, reject) => {
+                    connection.commit((err) => {
+                        if (err)
+                            reject(err);
+                        else
+                            resolve();
+                    });
+                });
+            }
+            catch (txnError) {
+                // ROLLBACK on failure
+                await new Promise((resolve) => {
+                    connection.rollback(() => resolve());
+                });
+                // CRITICAL RECONCILIATION LOG
+                console.error(`[CRITICAL PAYMENT RECONCILIATION NEEDED] CCAvenue payment captured, but DB transaction failed and was rolled back!`, {
+                    gateway: 'ccavenue',
+                    userId: paymentOrder.user_id,
+                    orderId,
+                    trackingId,
+                    bankRefNo,
+                    amount,
+                    error: txnError.message || txnError
+                });
+                // Record reconciliation alert in payment_logs on separate connection
+                try {
+                    await query(`
+            INSERT INTO payment_logs (user_id, order_id, payment_id, amount, status, payment_gateway, error_code, error_description, gateway_response)
+            VALUES (?, ?, ?, ?, 'reconciliation_required', 'ccavenue', 'DB_TXN_FAILED', ?, ?)
+          `, [
+                        paymentOrder.user_id,
+                        orderId,
+                        trackingId,
+                        amount,
+                        `CCAvenue captured payment but DB transaction failed: ${txnError.message}`,
+                        JSON.stringify(decryptedData)
+                    ]);
+                }
+                catch (logErr) {
+                    console.error("Failed to log CCAvenue reconciliation alert:", logErr);
+                }
+                return res.redirect(`https://vivaaha.net/payment/failed?order_id=${orderId}&tracking_id=${trackingId}&status=failed&message=${encodeURIComponent('Payment received but activation failed. Support has been notified for reconciliation.')}`);
+            }
+            // Post-commit PDF Generation (does not block subscription activation)
+            try {
+                const [paymentData] = await query(`
+          SELECT p.*, sp.plan_name, sp.duration_months,
+                 up.first_name, up.last_name, u.email, u.phone
+          FROM payments p
+          LEFT JOIN subscription_plans sp ON p.plan_id = sp.id
+          LEFT JOIN users u ON p.user_id = u.id
+          LEFT JOIN user_profiles up ON p.user_id = up.user_id
+          WHERE p.id = ?
+        `, [paymentInsertId]);
+                if (paymentData) {
+                    paymentData.invoice_number = invoiceNumber;
+                    const pdfUrl = await generateInvoicePDF(paymentData);
+                    await query(`
+            UPDATE payments SET invoice_pdf_url = ? WHERE id = ?
+          `, [pdfUrl, paymentInsertId]);
+                }
+            }
+            catch (pdfErr) {
+                console.error("Invoice PDF generation error (CCAvenue subscription already active):", pdfErr);
             }
             res.redirect(`https://vivaaha.net/payment/success?order_id=${orderId}&tracking_id=${trackingId}&amount=${amount}&status=success&invoice_number=${invoiceNumber}&invoice_url=${encodeURIComponent(invoiceUrl)}`);
         }
@@ -568,6 +654,11 @@ async function handleCCAvenueCallback(req, res) {
     catch (error) {
         console.error("CCAvenue Callback Error:", error);
         res.status(500).json({ success: false, message: "Server error" });
+    }
+    finally {
+        if (connection) {
+            connection.release();
+        }
     }
 }
 // CCAvenue Cancel Handler
